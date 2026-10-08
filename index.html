@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Nexo IGA — inteligência e governança de acessos multi-cloud">
+  <title>Nexo IGA</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css?v=20261007-dimensions">
+</head>
+<body>
+  <aside class="sidebar" aria-label="Navegação principal">
+    <div class="brand"><span class="brand-mark">N</span><span>Nexo<span class="muted">IGA</span></span></div>
+    <nav id="main-nav">
+      <button class="nav-item active" data-page="dashboard"><span>⌁</span> Visão geral</button>
+      <p class="nav-label">GOVERNANÇA</p>
+      <button class="nav-item" data-page="identidades"><span>◉</span> Identidades</button>
+      <button class="nav-item" data-page="projetos"><span>▦</span> Por projeto</button>
+      <button class="nav-item" data-page="roles"><span>⌘</span> Por role</button>
+      <button class="nav-item" data-page="contas"><span>◎</span> Por conta</button>
+      <button class="nav-item" data-page="acessos"><span>⇄</span> Inventário de acessos</button>
+      <button class="nav-item" data-page="riscos"><span>◇</span> Inteligência e riscos</button>
+      <button class="nav-item" data-page="privilegiados"><span>♢</span> Acesso privilegiado</button>
+      <button class="nav-item" data-page="ueba"><span>⌁</span> UEBA</button>
+      <p class="nav-label">PLATAFORMA</p>
+      <button class="nav-item" data-page="credenciais"><span>⊞</span> Credenciais</button>
+      <button class="nav-item" data-page="auditoria"><span>▤</span> Auditoria</button>
+      <button class="nav-item" data-page="compliance"><span>✓</span> Compliance</button>
+      <button class="nav-item admin-only" data-page="administracao"><span>⚙</span> Administração</button>
+    </nav>
+    <div class="sidebar-status"><span class="status-dot idle"></span><div><strong id="monitoring-status">Monitoramento não iniciado</strong><small id="last-analysis">Nenhuma análise executada</small></div></div>
+    <div class="user"><div class="avatar" id="user-avatar">AD</div><div><strong id="user-name">Administrador</strong><small id="user-role">Administrador</small></div><button id="logout" aria-label="Sair" title="Sair">↪</button></div>
+  </aside>
+
+  <main>
+    <header class="topbar">
+      <div class="mobile-brand"><span class="brand-mark">N</span> Nexo IGA</div>
+      <div class="top-actions">
+        <label class="search"><span>⌕</span><input id="global-search" placeholder="Buscar identidade, recurso ou risco..."></label>
+        <button class="icon-btn" aria-label="Notificações">♢<span class="notification-dot"></span></button>
+        <button class="primary-btn" id="new-credential-top">+ Nova integração</button>
+      </div>
+    </header>
+
+    <section id="dashboard" class="page active">
+      <div class="page-heading">
+        <div><p class="eyebrow">VISÃO GERAL</p><h1>Postura de acesso</h1><p>Riscos e identidades consolidados em todos os seus ambientes.</p></div>
+        <div class="environment-picker"><span>DOMÍNIO / AMBIENTE</span><select id="environment-filter"><option value="all">Todos os domínios e ambientes</option></select></div>
+      </div>
+
+      <div class="hero-grid">
+        <article class="risk-score-card">
+          <div class="card-header"><div><span class="card-kicker">NOTA DE POSTURA</span><h2>Postura geral</h2></div><span id="risk-trend" class="trend good">Sem dados</span></div>
+          <div class="score-content">
+            <div class="score-ring score-empty"><div><strong id="risk-score">0</strong><span>/100</span></div></div>
+            <div class="score-copy"><span id="risk-label" class="risk-label">SEM DADOS</span><p id="risk-summary">Nenhum ambiente conectado. Adicione uma credencial para iniciar a análise.</p><button class="text-btn" data-go="credenciais">Adicionar credencial →</button></div>
+          </div>
+        </article>
+        <article class="environment-card">
+          <div class="card-header"><div><span class="card-kicker">AMBIENTE</span><h2>Distribuição de risco</h2></div><button class="more-btn">•••</button></div>
+          <div class="risk-bars">
+            <div><span>Crítico</span><div class="bar"><i id="bar-critical" class="critical width-0"></i></div><strong id="count-critical">0</strong></div>
+            <div><span>Alto</span><div class="bar"><i id="bar-high" class="high width-0"></i></div><strong id="count-high">0</strong></div>
+            <div><span>Médio</span><div class="bar"><i id="bar-medium" class="medium width-0"></i></div><strong id="count-medium">0</strong></div>
+            <div><span>Baixo</span><div class="bar"><i id="bar-low" class="low width-0"></i></div><strong id="count-low">0</strong></div>
+          </div>
+          <div class="risk-total"><span>Riscos ativos</span><strong id="active-risk-count">0</strong><small id="environment-count">em 0 ambientes conectados</small></div>
+        </article>
+      </div>
+
+      <div class="metrics-grid">
+        <article class="metric"><div class="metric-icon blue">◉</div><div><span>Identidades</span><strong id="metric-identities">0</strong><small>inventário normalizado</small></div></article>
+        <article class="metric"><div class="metric-icon violet">⇄</div><div><span>Acessos</span><strong id="metric-accesses">0</strong><small>concessões analisadas</small></div></article>
+        <article class="metric"><div class="metric-icon amber">♢</div><div><span>Acessos privilegiados</span><strong id="metric-privileged">0</strong><small>funções de alto impacto</small></div></article>
+        <article class="metric"><div class="metric-icon teal">✓</div><div><span>Conformidade</span><strong id="metric-compliance">0%</strong><small>controles avaliados</small></div></article>
+      </div>
+
+      <article class="panel history-panel">
+        <div class="card-header"><div><span class="card-kicker">EVOLUÇÃO</span><h2>Tendência da postura de risco</h2></div><span id="history-caption" class="trend good">Aguardando análises</span></div>
+        <div id="risk-history-chart" class="trend-chart" aria-label="Histórico da nota de risco"></div>
+      </article>
+
+      <div class="content-grid">
+        <article class="panel risk-panel">
+          <div class="card-header"><div><span class="card-kicker">PRIORIDADES</span><h2>Riscos que exigem ação</h2></div><button class="text-btn" data-go="riscos">Ver todos →</button></div>
+          <div id="priority-risks" class="risk-list"></div>
+        </article>
+        <article class="panel">
+          <div class="card-header"><div><span class="card-kicker">COBERTURA</span><h2>Ambientes conectados</h2></div><button class="add-small" id="new-credential-card">+</button></div>
+          <div id="cloud-summary" class="cloud-list"></div>
+        </article>
+      </div>
+    </section>
+
+    <section id="credenciais" class="page">
+      <div class="page-heading"><div><p class="eyebrow">INTEGRAÇÕES</p><h1>Credenciais de acesso</h1><p>Gerencie a coleta segura dos ambientes AWS, Azure e Google Cloud.</p></div><button class="primary-btn" id="new-credential-page">+ Adicionar credencial</button></div>
+      <div class="notice"><span>ⓘ</span><div><strong>Credenciais protegidas</strong><p>As credenciais são criptografadas no banco e utilizadas somente pelos conectores do provedor selecionado.</p></div></div>
+      <div class="table-panel"><div class="table-tools"><label class="search light"><span>⌕</span><input id="credential-search" placeholder="Buscar integração..."></label><span id="credential-count"></span></div><div class="table-wrap"><table><thead><tr><th>Integração</th><th>Provedor</th><th>Escopo</th><th>Última sincronização</th><th>Status</th><th></th></tr></thead><tbody id="credentials-body"></tbody></table></div></div>
+    </section>
+
+    <section id="auditoria" class="page">
+      <div class="page-heading"><div><p class="eyebrow">TRILHA IMUTÁVEL</p><h1>Auditoria</h1><p>Mudanças de postura administrativa, credenciais e riscos.</p></div><button class="secondary-btn" id="export-audit">⇩ Exportar CSV</button></div>
+      <div class="audit-filters"><button class="chip active" data-audit="all">Todos</button><button class="chip" data-audit="admin">Administrativo</button><button class="chip" data-audit="risk">Riscos</button><button class="chip" data-audit="credential">Credenciais</button></div>
+      <div class="timeline" id="audit-timeline"></div>
+    </section>
+
+    <section id="riscos" class="page module-page"></section>
+    <section id="identidades" class="page module-page"></section>
+    <section id="projetos" class="page module-page"></section>
+    <section id="roles" class="page module-page"></section>
+    <section id="contas" class="page module-page"></section>
+    <section id="acessos" class="page module-page"></section>
+    <section id="privilegiados" class="page module-page"></section>
+    <section id="ueba" class="page module-page"></section>
+    <section id="compliance" class="page module-page"></section>
+    <section id="administracao" class="page">
+      <div class="page-heading"><div><p class="eyebrow">CONTROLE DE ACESSO</p><h1>Administração</h1><p>Gerencie usuários e perfis de acesso à plataforma.</p></div><button class="primary-btn" id="new-user">+ Novo usuário</button></div>
+      <div class="access-role-grid">
+        <article class="rule-card"><span>ADMIN</span><h3>Administrador</h3><p>Gerencia usuários, credenciais, análises e riscos.</p></article>
+        <article class="rule-card"><span>ANALYST</span><h3>Analista</h3><p>Opera integrações, análises e tratamento de riscos.</p></article>
+        <article class="rule-card"><span>AUDITOR</span><h3>Auditor</h3><p>Consulta inventários, conformidade e trilhas sem alterar dados.</p></article>
+      </div>
+      <div class="table-panel"><div class="table-tools"><strong>Usuários da plataforma</strong><span id="user-count"></span></div><div class="table-wrap"><table><thead><tr><th>Usuário</th><th>E-mail</th><th>Perfil</th><th>Status</th><th></th></tr></thead><tbody id="users-body"></tbody></table></div></div>
+    </section>
+  </main>
+
+  <div id="login-screen" class="login-screen">
+    <form id="login-form" class="login-card">
+      <div class="brand login-brand"><span class="brand-mark">N</span><span>Nexo IGA</span></div>
+      <p class="eyebrow">ACESSO SEGURO</p><h1>Entre na plataforma</h1><p>Use sua conta administrativa ou corporativa.</p>
+      <label>E-mail<input id="login-email" type="email" autocomplete="username" required placeholder="admin@empresa.com"></label>
+      <label>Senha<input id="login-password" type="password" autocomplete="current-password" required minlength="8" placeholder="Sua senha"></label>
+      <div id="login-feedback" class="json-feedback error"></div>
+      <button class="primary-btn login-submit" type="submit">Entrar</button>
+    </form>
+  </div>
+
+  <dialog id="credential-modal">
+    <form id="credential-form" method="dialog">
+      <div class="modal-header"><div><p class="eyebrow">INTEGRAÇÃO MULTI-CLOUD</p><h2 id="modal-title">Nova credencial</h2></div><button type="button" class="close-btn" id="close-modal">×</button></div>
+      <input type="hidden" id="credential-id">
+      <div class="form-grid"><label>Nome da integração<input id="credential-name" required placeholder="Nome da integração"></label><label>Provedor<select id="credential-provider" required><option>AWS</option><option>Azure</option><option>GCP</option></select></label></div>
+      <label>Credencial em JSON<textarea id="credential-json" required rows="9" spellcheck="false" placeholder='{"type": "service_account", ...}'></textarea><small>O JSON será validado conforme o provedor selecionado.</small></label>
+      <div id="json-feedback" class="json-feedback"></div>
+      <div class="modal-actions"><button type="button" class="secondary-btn" id="cancel-modal">Cancelar</button><button type="submit" class="primary-btn">Validar e conectar</button></div>
+    </form>
+  </dialog>
+  <dialog id="user-modal">
+    <form id="user-form" method="dialog">
+      <div class="modal-header"><div><p class="eyebrow">GESTÃO DE ACESSO</p><h2>Novo usuário</h2></div><button type="button" class="close-btn" id="close-user-modal">×</button></div>
+      <label>Nome<input id="new-user-name" required minlength="2"></label>
+      <label>E-mail<input id="new-user-email" type="email" required></label>
+      <div class="form-grid"><label>Perfil<select id="new-user-role"><option value="analyst">Analista</option><option value="auditor">Auditor</option><option value="admin">Administrador</option></select></label><label>Senha inicial<input id="new-user-password" type="password" required minlength="8"></label></div>
+      <div id="user-feedback" class="json-feedback error"></div>
+      <div class="modal-actions"><button type="button" class="secondary-btn" id="cancel-user-modal">Cancelar</button><button type="submit" class="primary-btn">Criar usuário</button></div>
+    </form>
+  </dialog>
+  <dialog id="privilege-modal" class="wide-modal">
+    <div class="modal-header"><div><p class="eyebrow">PRIVILEGED ACCESS INTELLIGENCE</p><h2>Dossiê do acesso</h2></div><button type="button" class="close-btn" id="close-privilege-modal">×</button></div>
+    <div id="privilege-content"></div>
+  </dialog>
+  <dialog id="identity-modal" class="wide-modal">
+    <div class="modal-header"><div><p class="eyebrow">IDENTITY INVENTORY</p><h2>Dossiê da identidade</h2></div><button type="button" class="close-btn" id="close-identity-modal">×</button></div>
+    <div id="identity-content"></div>
+  </dialog>
+  <dialog id="project-modal" class="wide-modal">
+    <div class="modal-header"><div><p class="eyebrow">PROJECT ACCESS PATH</p><h2>Projeto → Role → Conta</h2></div><button type="button" class="close-btn" id="close-project-modal">×</button></div>
+    <div id="project-content"></div>
+  </dialog>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script src="app.js?v=20261007-drilldown"></script>
+</body>
+</html>

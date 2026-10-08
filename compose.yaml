@@ -1,0 +1,98 @@
+services:
+  db:
+    image: postgres:17-alpine
+    container_name: nexo-iga-db
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-nexo_iga}
+      POSTGRES_USER: ${POSTGRES_USER:-nexo_iga}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-postgres-password}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    image: nexo-iga-api:local
+    container_name: nexo-iga-api
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-nexo_iga}:${POSTGRES_PASSWORD:-local-postgres-password}@db:5432/${POSTGRES_DB:-nexo_iga}
+      CREDENTIAL_MASTER_KEY: ${CREDENTIAL_MASTER_KEY:-local-development-key-change-me}
+      JWT_SECRET: ${JWT_SECRET:-local-jwt-secret-change-me-at-least-32-characters}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@nexo.local}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-change-me-now}
+      OLLAMA_URL: http://ollama:11434
+      QWEN_MODEL: ${QWEN_MODEL:-qwen3:1.7b}
+    depends_on:
+      db:
+        condition: service_healthy
+      qwen-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: nexo-iga-ollama
+    volumes:
+      - ollama-data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+  qwen-init:
+    image: ollama/ollama:latest
+    container_name: nexo-iga-qwen-init
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["ollama pull ${QWEN_MODEL:-qwen3:1.7b}"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: "no"
+
+  nexo-iga:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: nexo-iga:local
+    container_name: nexo-iga
+    ports:
+      - "8080:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+
+volumes:
+  postgres-data:
+  ollama-data:

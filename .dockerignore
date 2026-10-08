@@ -1,0 +1,11 @@
+.git
+.gitignore
+.DS_Store
+README.md
+compose.yaml
+Dockerfile*
+node_modules
+npm-debug.log
+__pycache__
+*.pyc
+*.db
