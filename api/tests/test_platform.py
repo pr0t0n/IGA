@@ -12,6 +12,7 @@ os.environ.setdefault("ADMIN_PASSWORD", "automated-admin-password")
 
 from fastapi.testclient import TestClient
 
+from connectors import ConnectorError
 from main import app
 
 
@@ -117,7 +118,9 @@ class PlatformEndToEndTest(unittest.TestCase):
 
         detail = self.client.get(f"/api/credentials/{credential_id}")
         self.assertEqual(detail.status_code, 200)
-        self.assertEqual(detail.json()["credential"]["accountId"], "123456789012")
+        self.assertNotIn("credential", detail.json())
+        self.assertEqual(detail.json()["principal"], AWS_CREDENTIAL["roleArn"])
+        self.assertEqual(detail.json()["kind"], "IAM Role (AssumeRole)")
 
         updated = self.client.put(f"/api/credentials/{credential_id}", json={
             "name": "AWS Automated Updated", "provider": "AWS", "credential": AWS_CREDENTIAL
@@ -127,7 +130,7 @@ class PlatformEndToEndTest(unittest.TestCase):
 
         with patch("main.discover", return_value=DISCOVERY_RESULT) as live_discovery:
             scan = self.client.post(f"/api/credentials/{credential_id}/scan")
-        live_discovery.assert_called_once_with("AWS", AWS_CREDENTIAL)
+        live_discovery.assert_called_once_with("AWS", AWS_CREDENTIAL, scopes=None)
         self.assertEqual(scan.status_code, 200)
         self.assertEqual(scan.json()["source"], "live")
         self.assertEqual(scan.json()["identities"], 2)
@@ -227,7 +230,7 @@ class PlatformEndToEndTest(unittest.TestCase):
             matrix_ids.append(matrix_id)
             with patch("main.discover", return_value=DISCOVERY_RESULT) as live_discovery:
                 provider_scan = self.client.post(f"/api/credentials/{matrix_id}/scan")
-            live_discovery.assert_called_once_with(provider, provider_credential)
+            live_discovery.assert_called_once_with(provider, provider_credential, scopes=None)
             self.assertEqual(provider_scan.status_code, 200)
             self.assertEqual(provider_scan.json()["provider"], provider)
             self.assertEqual(provider_scan.json()["source"], "live")
@@ -249,6 +252,99 @@ class PlatformEndToEndTest(unittest.TestCase):
         final_audit = self.client.get("/api/audit").json()
         removed_event = next(item for item in final_audit if item["title"] == "Credencial removida")
         self.assertEqual(removed_event["actor"], "admin@test.local")
+
+
+    def test_credential_validation_scope_selection_and_lifecycle(self):
+        requirements = self.client.get("/api/credentials/requirements").json()["providers"]
+        self.assertEqual({item["provider"] for item in requirements}, {"AWS", "Azure", "GCP"})
+        self.assertTrue(all(item["roles"] and item["checks"] and item["sample"] and item["required"] for item in requirements))
+
+        missing = self.client.post("/api/credentials/validate", json={
+            "provider": "GCP", "credential": {"type": "service_account"}
+        })
+        self.assertEqual(missing.status_code, 422)
+        self.assertIn("Campos obrigatórios ausentes para GCP", missing.json()["detail"]["errors"][0])
+
+        with patch("main.probe", side_effect=ConnectorError("Permissão obrigatória ausente: iam:ListUsers.")):
+            denied = self.client.post("/api/credentials/validate", json={"provider": "AWS", "credential": AWS_CREDENTIAL})
+        self.assertEqual(denied.status_code, 422)
+        self.assertIn("iam:ListUsers", denied.json()["detail"])
+
+        scopes = [
+            {"id": "123456789012", "name": "prod", "label": "123456789012 · prod"},
+            {"id": "210987654321", "name": "dev", "label": "210987654321 · dev"},
+        ]
+        probe_result = {
+            "identity": "arn:aws:iam::123456789012:user/reader", "scopes": scopes, "expiresAt": None,
+            "checks": [{"permission": "sts:GetCallerIdentity", "required": True, "granted": True}],
+        }
+        sts_output = {"Credentials": {
+            "AccessKeyId": "AKIATESTKEY12345678", "SecretAccessKey": "secret-test",
+            "SessionToken": "token-test", "Expiration": "2030-01-01T00:00:00Z",
+        }}
+        with patch("main.probe", return_value=probe_result) as live_probe:
+            validated = self.client.post("/api/credentials/validate", json={"provider": "AWS", "credential": sts_output})
+        self.assertEqual(validated.status_code, 200)
+        self.assertEqual(validated.json()["kind"], "Access key (IAM)")
+        self.assertEqual(validated.json()["scopes"], scopes)
+        self.assertEqual(live_probe.call_args.args[1]["accessKeyId"], "AKIATESTKEY12345678")
+
+        no_scope = self.client.post("/api/credentials", json={
+            "name": "Sem escopo", "provider": "AWS", "credential": sts_output, "scopes": []
+        })
+        self.assertEqual(no_scope.status_code, 422)
+
+        created = self.client.post("/api/credentials", json={
+            "name": "AWS Scoped", "provider": "AWS", "credential": sts_output, "scopes": [scopes[0]]
+        })
+        self.assertEqual(created.status_code, 201)
+        body = created.json()
+        credential_id = body["id"]
+        self.assertNotIn("credential", body)
+        self.assertEqual(body["scopes"], [scopes[0]])
+        self.assertEqual(body["scopeSelection"], "selected")
+        self.assertEqual(body["principal"], "AKIA…5678")
+        self.assertTrue(body["expiresAt"].startswith("2030-01-01"))
+        self.assertNotIn("credential", self.client.get(f"/api/credentials/{credential_id}").json())
+
+        with patch("main.discover", side_effect=ConnectorError("Falha simulada no provedor.")):
+            failed = self.client.post(f"/api/credentials/{credential_id}/scan")
+        self.assertEqual(failed.status_code, 502)
+        failed_view = self.client.get(f"/api/credentials/{credential_id}").json()
+        self.assertEqual(failed_view["status"], "Erro")
+        self.assertEqual(failed_view["lastError"], "Falha simulada no provedor.")
+
+        discovery = {**DISCOVERY_RESULT, "principal": "arn:aws:iam::123456789012:user/reader"}
+        with patch("main.discover", return_value=discovery) as live_discovery:
+            scanned = self.client.post(f"/api/credentials/{credential_id}/scan")
+        self.assertEqual(scanned.status_code, 200)
+        self.assertEqual(live_discovery.call_args.kwargs["scopes"], ["123456789012"])
+        connected = self.client.get(f"/api/credentials/{credential_id}").json()
+        self.assertEqual(connected["status"], "Conectado")
+        self.assertIsNone(connected["lastError"])
+        self.assertEqual(connected["principal"], "arn:aws:iam::123456789012:user/reader")
+
+        renamed = self.client.put(f"/api/credentials/{credential_id}", json={"name": "AWS Renamed", "provider": "AWS"})
+        self.assertEqual(renamed.status_code, 200)
+        self.assertEqual(renamed.json()["name"], "AWS Renamed")
+        self.assertEqual(renamed.json()["lastSyncedAt"], connected["lastSyncedAt"])
+        self.assertEqual(renamed.json()["status"], "Conectado")
+
+        switched = self.client.put(f"/api/credentials/{credential_id}", json={"name": "AWS Renamed", "provider": "GCP"})
+        self.assertEqual(switched.status_code, 422)
+
+        rescoped = self.client.put(f"/api/credentials/{credential_id}", json={
+            "name": "AWS Renamed", "provider": "AWS", "credential": sts_output, "scopes": [scopes[1]]
+        })
+        self.assertEqual(rescoped.status_code, 200)
+        self.assertEqual(rescoped.json()["scopes"], [scopes[1]])
+        self.assertEqual(rescoped.json()["status"], "Pendente")
+        self.assertIsNone(rescoped.json()["lastSyncedAt"])
+        self.assertEqual(self.client.get(f"/api/identities?credential_id={credential_id}").json(), [])
+
+        self.assertEqual(self.client.delete(f"/api/credentials/{credential_id}").status_code, 204)
+        removed = next(item for item in self.client.get("/api/audit").json() if item["title"] == "Credencial removida")
+        self.assertIn("Achados abertos no momento da remoção", removed["text"])
 
 
 if __name__ == "__main__":

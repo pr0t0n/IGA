@@ -34,11 +34,50 @@ function renderRisks(){
 function renderClouds(){
   document.querySelector('#cloud-summary').innerHTML = state.credentials.map(c => `<div class="cloud-item"><span class="cloud-logo ${providerClass(c.provider)}">${c.provider}</span><div><strong>${escapeHtml(c.name)}</strong><small>${escapeHtml(c.scope)}</small></div><span class="cloud-status">● ${escapeHtml(c.status)}</span></div>`).join('');
 }
-function renderCredentials(query=''){
-  const filtered=state.credentials.filter(c=>`${c.name} ${c.provider} ${c.scope}`.toLowerCase().includes(query.toLowerCase()));
-  document.querySelector('#credential-count').textContent=`${filtered.length} integrações`;
-  document.querySelector('#credentials-body').innerHTML=filtered.map(c=>`<tr><td><div class="integration-cell"><span class="cloud-logo ${providerClass(c.provider)}">${c.provider}</span><div><strong>${escapeHtml(c.name)}</strong><small>ID ${String(c.id).padStart(4,'0')}</small></div></div></td><td>${c.provider}</td><td>${escapeHtml(c.scope)}</td><td>${formatDate(c.lastSyncedAt)}</td><td><span class="status-pill">● ${escapeHtml(c.status)}</span></td><td class="row-actions">${state.user?.role==='auditor'?'Somente leitura':`<button onclick="scanCredential(${c.id},this)">Analisar</button><button onclick="editCredential(${c.id})">Editar</button><button class="delete" onclick="deleteCredential(${c.id})">Remover</button>`}</td></tr>`).join('') || '<tr><td colspan="6">Nenhuma credencial cadastrada. Use “Adicionar credencial” para conectar um ambiente.</td></tr>';
+const SCOPE_KIND={GCP:'Projeto',AWS:'Conta',Azure:'Assinatura'};
+const EXPIRY_WARNING_DAYS=15;
+const MAX_SCOPE_TAGS=8;
+const pageTrail={dashboard:['Visão geral','Postura de acesso'],identidades:['Governança','Identidades'],projetos:['Governança','Por projeto'],roles:['Governança','Por role'],contas:['Governança','Por conta'],acessos:['Governança','Inventário de acessos'],riscos:['Governança','Inteligência e riscos'],privilegiados:['Governança','Acesso privilegiado'],ueba:['Governança','UEBA'],credenciais:['Plataforma','Credenciais de acesso'],auditoria:['Plataforma','Auditoria'],compliance:['Plataforma','Compliance'],administracao:['Plataforma','Administração']};
+const credentialUi={requirements:[],scanning:new Set(),mode:'add',editing:null,provider:'GCP',validated:null,selected:new Set(),validating:false,saving:false,error:'',removeId:null};
+const icons={
+  check:'<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg>',
+  cross:'<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"></path></svg>'
+};
+function credentialRequirement(provider){return credentialUi.requirements.find(r=>r.provider===provider)}
+function daysUntil(value){return value?Math.ceil((new Date(value)-Date.now())/86400000):null}
+function credentialStatus(c){
+  if(credentialUi.scanning.has(c.id))return {label:'Em análise',tag:'tag-outline',attention:false};
+  if(c.status==='Erro')return {label:'Falha na última análise',tag:'tag-accent',attention:true};
+  const days=daysUntil(c.expiresAt);
+  if(days!==null&&days<=0)return {label:'Credencial expirada',tag:'tag-accent',attention:true};
+  if(days!==null&&days<=EXPIRY_WARNING_DAYS)return {label:`Expira em ${days} dia${days===1?'':'s'}`,tag:'tag-accent',attention:true};
+  if(c.status==='Conectado')return {label:'Ativa',tag:'tag-neutral',attention:false};
+  return {label:'Aguardando análise',tag:'tag-outline',attention:false};
+}
+function credentialRow(c){
+  const status=credentialStatus(c);const scanning=credentialUi.scanning.has(c.id);const lock=scanning?' disabled':'';
+  const shown=c.scopes.slice(0,MAX_SCOPE_TAGS);const remaining=c.scopes.length-shown.length;
+  const scopes=shown.map(s=>`<span class="tag tag-neutral" title="${escapeHtml(s.name)}">${escapeHtml(s.label)}</span>`).join('')+(remaining>0?`<span class="tag tag-neutral">+${remaining}</span>`:'');
+  const scopeText=c.scopes.length?`${c.scopes.length} ${(SCOPE_KIND[c.provider]||'escopo').toLowerCase()}(s)`:'escopos descobertos na primeira análise';
+  const actions=state.user?.role==='auditor'?'<span class="ds-muted-sm">Somente leitura</span>':`<button type="button" class="btn btn-secondary" data-credential-action="scan" data-id="${c.id}"${lock}>${scanning?'Analisando…':c.lastSyncedAt?'Reanalisar':'Analisar'}</button><button type="button" class="btn btn-secondary" data-credential-action="edit" data-id="${c.id}"${lock}>Editar</button><button type="button" class="btn btn-ghost" data-credential-action="remove" data-id="${c.id}"${lock}>Remover</button>`;
+  return `<article class="ds-cred"><div class="ds-cred-prov">${escapeHtml(c.provider)}</div><div class="ds-cred-body"><div class="ds-cred-title"><span class="ds-cred-name">${escapeHtml(c.name)}</span><span class="tag ${status.tag}">${escapeHtml(status.label)}</span></div><div class="ds-cred-ident" title="${escapeHtml(c.principal)}">${escapeHtml(c.kind)}${c.principal?` · ${escapeHtml(c.principal)}`:''}</div>${scopes?`<div class="ds-cred-scopes">${scopes}</div>`:''}${c.status==='Erro'&&c.lastError?`<div class="ds-cred-error">${escapeHtml(c.lastError)}</div>`:''}<div class="ds-cred-meta">Última análise: ${formatDate(c.lastSyncedAt)} · ${escapeHtml(scopeText)}</div></div><div class="ds-cred-actions">${actions}</div></article>`;
+}
+function renderCredentials(){
+  const creds=state.credentials;const providers=['GCP','AWS','Azure'].filter(provider=>creds.some(c=>c.provider===provider));
+  const stats=[
+    ['Credenciais',creds.length,'cadastradas'],
+    ['Escopos analisados',creds.reduce((total,c)=>total+c.scopes.length,0),'projetos, contas e assinaturas'],
+    ['Provedores',providers.length,providers.length?providers.join(' · '):'GCP · AWS · Azure'],
+    ['Precisam de atenção',creds.filter(c=>credentialStatus(c).attention).length,'expirando ou com falha']
+  ];
+  document.querySelector('#credential-stats').innerHTML=stats.map(([label,value,sub])=>`<div class="ds-stat"><div class="ds-stat-label">${label}</div><div class="ds-stat-value">${value.toLocaleString('pt-BR')}</div><div class="ds-stat-sub">${escapeHtml(sub)}</div></div>`).join('');
+  document.querySelector('#credential-empty').hidden=creds.length>0;
+  document.querySelector('#credential-list').innerHTML=creds.map(credentialRow).join('');
   renderClouds();
+}
+function renderCredentialRequirements(){
+  const reqs=credentialUi.requirements;
+  document.querySelector('#credential-requirements').innerHTML=reqs.length?reqs.map(r=>`<div class="ds-req"><div class="ds-req-title">${escapeHtml(r.provider)} <span>· ${escapeHtml(r.kind)}</span></div>${r.roles.map(role=>`<div class="ds-req-perm">${escapeHtml(role)}</div>`).join('')}</div>`).join(''):'<div class="ds-req"><div class="ds-muted-sm">Requisitos indisponíveis: a API não respondeu.</div></div>';
 }
 function renderAudit(filter='all'){
   const events=state.audit.filter(e=>filter==='all'||e.type===filter);
@@ -52,31 +91,114 @@ function renderModules(){
 function navigate(page){
   document.querySelectorAll('.page').forEach(p=>p.classList.toggle('active',p.id===page));
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.page===page));
+  document.body.dataset.page=page;
+  const [section,title]=pageTrail[page]||['Plataforma',page];
+  document.querySelector('#breadcrumb-section').textContent=section;document.querySelector('#breadcrumb-page').textContent=title;
   window.scrollTo({top:0,behavior:'smooth'});
 }
-function openModal(credential){
-  document.querySelector('#credential-form').reset(); document.querySelector('#json-feedback').textContent=''; document.querySelector('#json-feedback').className='json-feedback';
-  document.querySelector('#credential-id').value=credential?.id||'';
-  document.querySelector('#modal-title').textContent=credential?'Editar credencial':'Nova credencial';
-  if(credential){document.querySelector('#credential-name').value=credential.name;document.querySelector('#credential-provider').value=credential.provider;document.querySelector('#credential-json').value=credential.json;}
+function credentialJson(){return document.querySelector('#credential-json').value.trim()}
+function credentialProviderChanged(){return credentialUi.mode==='edit'&&credentialUi.provider!==credentialUi.editing.provider}
+function openCredentialDialog(credential=null){
+  Object.assign(credentialUi,{mode:credential?'edit':'add',editing:credential,provider:credential?.provider||'GCP',validated:null,selected:new Set(),validating:false,saving:false,error:''});
+  document.querySelector('#credential-modal-title').textContent=credential?'Editar credencial':'Nova credencial';
+  document.querySelector('#credential-name').value=credential?.name||'';
+  document.querySelector('#credential-json').value='';
+  syncCredentialDialog();
   document.querySelector('#credential-modal').showModal();
+  document.querySelector('#credential-name').focus();
 }
-async function editCredential(id){
-  try{const item=await api(`/credentials/${id}`);openModal({...item,json:JSON.stringify(item.credential,null,2)})}catch(error){toast(error.message)}
+function syncCredentialDialog(){
+  const ui=credentialUi;const req=credentialRequirement(ui.provider);const isEdit=ui.mode==='edit';
+  document.querySelectorAll('input[name="credential-provider"]').forEach(radio=>{radio.checked=radio.value===ui.provider});
+  document.querySelector('#credential-json').placeholder=req?JSON.stringify(Object.fromEntries(req.required[0].map(key=>[key,'…'])),null,2):'';
+  const required=req?`Campos obrigatórios: ${req.required.map(set=>set.join(', ')).join(' ou ')}.`:'O JSON será validado conforme o provedor selecionado.';
+  document.querySelector('#credential-json-hint').textContent=isEdit&&!credentialProviderChanged()?'Deixe em branco para manter a credencial atual. Uma nova credencial substitui a anterior.':`${isEdit?`Ao trocar para ${ui.provider}, informe uma nova credencial. `:''}${required}`;
+  const error=document.querySelector('#credential-error');error.hidden=!ui.error;error.textContent=ui.error;
+  renderCredentialValidation();
+  syncCredentialActions();
 }
-async function deleteCredential(id){
-  const item=state.credentials.find(c=>c.id===id); if(!item||!confirm(`Remover a integração “${item.name}”?`))return;
-  try{await api(`/credentials/${id}`,{method:'DELETE'});await loadCredentials();await loadAudit();toast('Integração removida.')}catch(error){toast(error.message)}
+function syncCredentialActions(){
+  const ui=credentialUi;const isEdit=ui.mode==='edit';const json=credentialJson();
+  const validate=document.querySelector('#credential-validate');
+  validate.hidden=Boolean(ui.validated)||(isEdit&&!json);
+  validate.disabled=ui.validating||ui.saving;
+  validate.textContent=ui.validating?'Analisando acesso…':'Validar credencial';
+  const needsValidation=!isEdit||Boolean(json)||credentialProviderChanged();
+  const save=document.querySelector('#credential-save');
+  save.disabled=ui.saving||ui.validating||(needsValidation&&!ui.validated)||Boolean(ui.validated&&!ui.selected.size);
+  save.textContent=ui.saving?'Salvando…':isEdit?'Salvar alterações':'Salvar integração';
 }
-async function scanCredential(id,button){
-  if(button?.disabled)return;
-  if(button){button.disabled=true;button.textContent='Analisando…'}
-  toast('Análise em andamento. Aguarde a coleta do provedor.',300000);
+function renderCredentialValidation(){
+  const ui=credentialUi;const box=document.querySelector('#credential-validated');const v=ui.validated;
+  box.hidden=!v;
+  if(!v){box.innerHTML='';return}
+  const kind=SCOPE_KIND[ui.provider]||'Escopo';
+  const scopes=v.scopes.map(s=>`<label class="ds-check"><input type="checkbox" data-scope-id="${escapeHtml(s.id)}"${ui.selected.has(s.id)?' checked':''}><span class="ds-check-name">${escapeHtml(s.label)}</span><span class="ds-muted-sm">${kind}</span></label>`).join('');
+  const checks=v.checks.map(k=>`<div class="ds-perm${k.granted?'':' is-missing'}">${k.granted?icons.check:icons.cross}<span class="ds-mono">${escapeHtml(k.permission)}</span>${k.granted?'':'<span class="ds-muted-sm">opcional · não concedida</span>'}</div>`).join('');
+  const toggle=v.scopes.length>1?`<button type="button" class="btn btn-ghost ds-btn-xs" data-scope-all>${ui.selected.size===v.scopes.length?'Desmarcar todos':'Marcar todos'}</button>`:'';
+  const expiry=v.expiresAt?`<div class="ds-muted-sm">Validade da credencial: até ${formatDate(v.expiresAt)}</div>`:'';
+  box.innerHTML=`<div class="ds-validated-head"><span class="ds-strong">Acesso validado</span><span class="ds-mono ds-muted-sm">${escapeHtml(v.identity)}</span></div>${expiry}<div class="ds-overline-row"><span class="ds-overline">Escopos detectados · selecione o que analisar</span>${toggle}</div><div class="ds-scope-list">${scopes}</div><div class="ds-overline ds-overline-gap">Permissões verificadas</div>${checks}`;
+}
+async function validateCredentialForm(){
+  const ui=credentialUi;const raw=credentialJson();const provider=ui.provider;let parsed;
+  try{parsed=JSON.parse(raw)}catch{Object.assign(ui,{error:'JSON inválido: verifique aspas, vírgulas e chaves.',validated:null});return syncCredentialDialog()}
+  if(!parsed||Array.isArray(parsed)||typeof parsed!=='object'){Object.assign(ui,{error:'A credencial precisa ser um objeto JSON.',validated:null});return syncCredentialDialog()}
+  Object.assign(ui,{error:'',validating:true});syncCredentialDialog();
+  const current=()=>provider===ui.provider&&raw===credentialJson();
+  try{
+    const result=await api('/credentials/validate',{method:'POST',body:JSON.stringify({provider,credential:parsed})});
+    if(!current())return;
+    const saved=new Set(ui.editing?.provider===provider?ui.editing.scopes.map(s=>s.id):[]);
+    const kept=result.scopes.filter(s=>saved.has(s.id));
+    ui.validated=result;ui.selected=new Set((kept.length?kept:result.scopes).map(s=>s.id));
+  }catch(error){if(current())ui.error=error.message}
+  finally{ui.validating=false;syncCredentialDialog()}
+}
+function suggestedCredentialName(scopes){
+  const slug=`${credentialUi.provider}-${scopes?.[0]?.id||'integracao'}`.toLowerCase().replace(/[^a-z0-9-]+/g,'-').replace(/^-+|-+$/g,'').slice(0,60);
+  return slug.length>=2?slug:'nova-integracao';
+}
+async function saveCredentialForm(){
+  const ui=credentialUi;const isEdit=ui.mode==='edit';const v=ui.validated;const modal=document.querySelector('#credential-modal');
+  const scopes=v?v.scopes.filter(s=>ui.selected.has(s.id)):null;
+  const body={name:document.querySelector('#credential-name').value.trim()||(isEdit?ui.editing.name:suggestedCredentialName(scopes)),provider:ui.provider};
+  if(v){body.credential=JSON.parse(credentialJson());body.scopes=scopes}
+  Object.assign(ui,{saving:true,error:''});syncCredentialDialog();
+  try{
+    const saved=await api(isEdit?`/credentials/${ui.editing.id}`:'/credentials',{method:isEdit?'PUT':'POST',body:JSON.stringify(body)});
+    modal.close();
+    await Promise.all([loadCredentials(),loadAudit()]);
+    if(!v){toast('Credencial atualizada.');loadPlatformData();return}
+    toast(isEdit?`Credencial atualizada. Análise iniciada em ${scopes.length} escopo(s).`:`Credencial "${saved.name}" adicionada. Análise iniciada em ${scopes.length} escopo(s).`,4000);
+    scanCredential(saved.id,{announce:false});
+  }catch(error){ui.error=error.message}
+  finally{ui.saving=false;if(modal.open)syncCredentialDialog()}
+}
+function openRemoveDialog(id){
+  const c=state.credentials.find(item=>item.id===id);if(!c)return;
+  credentialUi.removeId=id;
+  document.querySelector('#credential-remove-text').textContent=`A integração "${c.name}" (${c.provider}) será removida e ${c.scopes.length} escopo(s) deixarão de ser analisados. Achados históricos ficam preservados na Auditoria.`;
+  document.querySelector('#credential-remove-confirm').disabled=false;
+  document.querySelector('#credential-remove-modal').showModal();
+}
+async function confirmRemoveCredential(){
+  const modal=document.querySelector('#credential-remove-modal');const button=document.querySelector('#credential-remove-confirm');
+  const c=state.credentials.find(item=>item.id===credentialUi.removeId);if(!c)return modal.close();
+  button.disabled=true;
+  try{await api(`/credentials/${c.id}`,{method:'DELETE'});modal.close();await Promise.all([loadCredentials(),loadAudit(),loadPlatformData()]);toast(`Credencial "${c.name}" removida.`)}
+  catch(error){toast(error.message)}finally{button.disabled=false}
+}
+async function scanCredential(id,{announce=true}={}){
+  if(credentialUi.scanning.has(id))return;
+  credentialUi.scanning.add(id);renderCredentials();
+  if(announce)toast('Análise em andamento. Aguarde a coleta do provedor.',300000);
   try{
     const result=await api(`/credentials/${id}/scan`,{method:'POST'});
+    credentialUi.scanning.delete(id);
     await Promise.all([loadCredentials(),loadAudit(),loadPlatformData()]);
     toast(`Análise concluída: ${result.findings} riscos encontrados.`);
-  }catch(error){toast(error.message)}finally{if(button?.isConnected){button.disabled=false;button.textContent='Analisar'}}
+  }catch(error){credentialUi.scanning.delete(id);await Promise.all([loadCredentials(),loadAudit()]);toast(error.message,5000)}
+  finally{credentialUi.scanning.delete(id);renderCredentials()}
 }
 async function resolveFinding(id){
   const justification=prompt('Informe a justificativa para resolver este risco:');
@@ -89,20 +211,39 @@ function escapeHtml(v){return String(v).replace(/[&<>'"]/g,c=>({'&':'&amp;','<':
 
 document.querySelector('#main-nav').addEventListener('click',e=>{const b=e.target.closest('[data-page]');if(b)navigate(b.dataset.page)});
 document.querySelectorAll('[data-go]').forEach(b=>b.addEventListener('click',()=>navigate(b.dataset.go)));
-['#new-credential-top','#new-credential-card','#new-credential-page'].forEach(s=>document.querySelector(s).addEventListener('click',()=>openModal()));
-['#close-modal','#cancel-modal'].forEach(s=>document.querySelector(s).addEventListener('click',()=>document.querySelector('#credential-modal').close()));
-document.querySelector('#credential-search').addEventListener('input',e=>renderCredentials(e.target.value));
-document.querySelectorAll('[data-audit]').forEach(b=>b.addEventListener('click',()=>{document.querySelectorAll('[data-audit]').forEach(x=>x.classList.remove('active'));b.classList.add('active');renderAudit(b.dataset.audit)}));
-document.querySelector('#credential-json').addEventListener('input',e=>{const f=document.querySelector('#json-feedback');try{JSON.parse(e.target.value);f.textContent='✓ JSON válido';f.className='json-feedback ok'}catch{f.textContent=e.target.value?'JSON ainda não é válido.':'';f.className='json-feedback error'}});
-document.querySelector('#credential-form').addEventListener('submit',async e=>{
-  e.preventDefault();let parsed;const feedback=document.querySelector('#json-feedback');try{parsed=JSON.parse(document.querySelector('#credential-json').value)}catch{feedback.textContent='Revise a sintaxe: a credencial precisa ser um JSON válido.';feedback.className='json-feedback error';return}
-  if(!parsed||Array.isArray(parsed)||typeof parsed!=='object'){feedback.textContent='A credencial precisa ser um objeto JSON.';feedback.className='json-feedback error';return}
-  const id=Number(document.querySelector('#credential-id').value);const provider=document.querySelector('#credential-provider').value;const name=document.querySelector('#credential-name').value.trim();
-  try{
-    await api(id?`/credentials/${id}`:'/credentials',{method:id?'PUT':'POST',body:JSON.stringify({name,provider,credential:parsed})});
-    await loadCredentials();await loadAudit();document.querySelector('#credential-modal').close();toast(id?'Credencial atualizada; execute uma nova análise.':'Credencial salva; execute a análise para validar a conexão.');
-  }catch(error){feedback.textContent=error.message;feedback.className='json-feedback error'}
+['#new-credential-top','#new-credential-card','#new-credential-page','#new-credential-empty'].forEach(s=>document.querySelector(s).addEventListener('click',()=>openCredentialDialog()));
+document.querySelector('#credential-list').addEventListener('click',e=>{
+  const button=e.target.closest('[data-credential-action]');if(!button)return;
+  const c=state.credentials.find(item=>item.id===Number(button.dataset.id));if(!c)return;
+  ({scan:()=>scanCredential(c.id),edit:()=>openCredentialDialog(c),remove:()=>openRemoveDialog(c.id)})[button.dataset.credentialAction]?.();
 });
+document.querySelectorAll('[data-close-credential]').forEach(b=>b.addEventListener('click',()=>document.querySelector('#credential-modal').close()));
+document.querySelector('#credential-modal').addEventListener('cancel',e=>{if(credentialUi.saving)e.preventDefault()});
+document.querySelectorAll('input[name="credential-provider"]').forEach(radio=>radio.addEventListener('change',()=>{if(radio.checked){Object.assign(credentialUi,{provider:radio.value,validated:null,error:''});syncCredentialDialog()}}));
+document.querySelector('#credential-json').addEventListener('input',()=>{if(credentialUi.validated||credentialUi.error){Object.assign(credentialUi,{validated:null,error:''});syncCredentialDialog()}else syncCredentialActions()});
+document.querySelector('#credential-sample').addEventListener('click',()=>{
+  const req=credentialRequirement(credentialUi.provider);if(!req)return;
+  const field=document.querySelector('#credential-json');field.value=JSON.stringify(req.sample,null,2);
+  Object.assign(credentialUi,{validated:null,error:''});syncCredentialDialog();field.focus();
+});
+document.querySelector('#credential-validate').addEventListener('click',validateCredentialForm);
+document.querySelector('#credential-save').addEventListener('click',saveCredentialForm);
+document.querySelector('#credential-validated').addEventListener('change',e=>{
+  const box=e.target.closest('[data-scope-id]');if(!box)return;
+  if(box.checked)credentialUi.selected.add(box.dataset.scopeId);else credentialUi.selected.delete(box.dataset.scopeId);
+  const toggle=document.querySelector('[data-scope-all]');
+  if(toggle)toggle.textContent=credentialUi.selected.size===credentialUi.validated.scopes.length?'Desmarcar todos':'Marcar todos';
+  syncCredentialActions();
+});
+document.querySelector('#credential-validated').addEventListener('click',e=>{
+  if(!e.target.closest('[data-scope-all]'))return;
+  const scopes=credentialUi.validated.scopes;
+  credentialUi.selected=credentialUi.selected.size===scopes.length?new Set():new Set(scopes.map(s=>s.id));
+  renderCredentialValidation();syncCredentialActions();
+});
+document.querySelectorAll('[data-close-remove]').forEach(b=>b.addEventListener('click',()=>document.querySelector('#credential-remove-modal').close()));
+document.querySelector('#credential-remove-confirm').addEventListener('click',confirmRemoveCredential);
+document.querySelectorAll('[data-audit]').forEach(b=>b.addEventListener('click',()=>{document.querySelectorAll('[data-audit]').forEach(x=>x.classList.remove('active'));b.classList.add('active');renderAudit(b.dataset.audit)}));
 document.querySelector('#export-audit').addEventListener('click',()=>{
   const csv='Data,Evento,Descrição,Ator\n'+state.audit.map(e=>[e.date,e.title,e.text,e.actor].map(v=>`"${v.replaceAll('"','""')}"`).join(',')).join('\n');const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));a.download='auditoria-nexo-iga.csv';a.click();URL.revokeObjectURL(a.href);toast('Auditoria exportada.');
 });
@@ -128,7 +269,11 @@ document.querySelector('#user-form').addEventListener('submit',async e=>{
 });
 
 async function loadCredentials(){
-  try{state.credentials=await api('/credentials');renderCredentials(document.querySelector('#credential-search').value)}catch(error){toast(`API indisponível: ${error.message}`)}
+  try{state.credentials=await api('/credentials');renderCredentials()}catch(error){toast(`API indisponível: ${error.message}`)}
+}
+async function loadCredentialRequirements(){
+  try{credentialUi.requirements=(await api('/credentials/requirements')).providers}catch{credentialUi.requirements=[]}
+  renderCredentialRequirements();
 }
 async function loadAudit(){
   try{
@@ -317,7 +462,7 @@ function applyUser(){
   document.querySelector('#user-role').textContent=roleLabels[state.user.role]||state.user.role;
   document.querySelector('#user-avatar').textContent=state.user.name.split(/\s+/).map(part=>part[0]).join('').slice(0,2).toUpperCase();
   document.querySelectorAll('.admin-only').forEach(element=>element.classList.toggle('hidden',state.user.role!=='admin'));
-  ['#new-credential-top','#new-credential-card','#new-credential-page'].forEach(selector=>document.querySelector(selector).hidden=state.user.role==='auditor');
+  ['#new-credential-top','#new-credential-card','#new-credential-page','#new-credential-empty'].forEach(selector=>document.querySelector(selector).hidden=state.user.role==='auditor');
 }
 async function loadUsers(){
   if(state.user?.role!=='admin')return;
@@ -328,7 +473,7 @@ async function togglePlatformUser(id,active){try{await api(`/users/${id}`,{metho
 async function deletePlatformUser(id){if(!confirm('Remover este usuário da plataforma?'))return;try{await api(`/users/${id}`,{method:'DELETE'});await loadUsers();toast('Usuário removido.')}catch(error){toast(error.message)}}
 async function initializePlatform(){
   renderRisks();renderCredentials();renderAudit();renderModules();
-  await Promise.all([loadCredentials(),loadAudit(),loadPlatformData(),loadUsers()]);
+  await Promise.all([loadCredentialRequirements(),loadCredentials(),loadAudit(),loadPlatformData(),loadUsers()]);
 }
 async function bootstrap(){
   if(!state.token){showLogin();return}

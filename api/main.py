@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-from connectors import ConnectorError, discover
+from connectors import REQUIREMENTS, ConnectorError, aws_expiry, describe_credential, discover, normalize_credential, probe, scope_entry
 
 DB_PATH = os.getenv("DATABASE_PATH", "/data/iga.db")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
@@ -68,15 +68,31 @@ def role_context(provider: str, role: str, resource_type: str) -> dict[str, str]
     return {"label": role, "capability": f"Função concedida no escopo de {resource_type} coletado pelo provedor.", "severity": severity}
 
 
+class ScopeInput(BaseModel):
+    id: str = Field(min_length=1, max_length=300)
+    name: str = Field(min_length=1, max_length=300)
+    label: str = Field(min_length=1, max_length=400)
+
+
 class CredentialInput(BaseModel):
     name: str = Field(min_length=2, max_length=100)
     provider: Literal["AWS", "Azure", "GCP"]
     credential: dict[str, Any]
+    scopes: list[ScopeInput] | None = Field(default=None, max_length=5000)
 
     @field_validator("name")
     @classmethod
     def clean_name(cls, value: str) -> str:
         return value.strip()
+
+
+class CredentialUpdate(CredentialInput):
+    credential: dict[str, Any] | None = None
+
+
+class CredentialValidation(BaseModel):
+    provider: Literal["AWS", "Azure", "GCP"]
+    credential: dict[str, Any]
 
 
 class FindingUpdate(BaseModel):
@@ -195,6 +211,11 @@ def init_db() -> None:
             scope TEXT NOT NULL DEFAULT 'Análise pendente',
             status TEXT NOT NULL DEFAULT 'Pendente',
             last_synced_at TEXT,
+            auth_kind TEXT,
+            principal TEXT,
+            scopes_json TEXT,
+            last_error TEXT,
+            expires_at TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -322,8 +343,17 @@ def init_db() -> None:
             ).fetchall()}
         else:
             credential_columns = {row["name"] for row in connection.execute("PRAGMA table_info(credentials)").fetchall()}
-        if "last_synced_at" not in credential_columns:
-            connection.execute("ALTER TABLE credentials ADD COLUMN last_synced_at TEXT")
+        for column in ("last_synced_at", "auth_kind", "principal", "scopes_json", "last_error", "expires_at"):
+            if column not in credential_columns:
+                connection.execute(f"ALTER TABLE credentials ADD COLUMN {column} TEXT")
+        for legacy in connection.execute(
+            "SELECT id,provider,encrypted_payload FROM credentials WHERE principal IS NULL OR principal=''"
+        ).fetchall():
+            try:
+                kind, principal = describe_credential(legacy["provider"], json.loads(cipher.decrypt(legacy["encrypted_payload"]).decode()))
+            except (InvalidToken, ValueError):
+                continue
+            connection.execute("UPDATE credentials SET auth_kind=?,principal=? WHERE id=?", (kind, principal, legacy["id"]))
         existing_admin = connection.execute("SELECT id FROM platform_users WHERE email=?", (ADMIN_EMAIL,)).fetchone()
         if not existing_admin:
             now = utc_now()
@@ -439,39 +469,67 @@ def delete_user(user_id: int, request: Request) -> Response:
 
 
 def validate_provider(provider: str, payload: dict[str, Any]) -> list[str]:
-    accepted = {
-        "AWS": [
-            ("accountId", "roleArn"),
-            ("accessKeyId", "secretAccessKey"),
-            ("aws_access_key_id", "aws_secret_access_key"),
-        ],
-        "Azure": [("tenantId", "clientId", "clientSecret"), ("tenant_id", "client_id", "client_secret")],
-        "GCP": [("type", "project_id", "private_key", "client_email")],
-    }
-    for required_set in accepted[provider]:
-        missing = [key for key in required_set if not payload.get(key)]
-        if not missing:
-            if provider == "GCP" and payload.get("type") != "service_account":
-                return ["type deve ser service_account"]
-            return []
-    alternatives = [" + ".join(items) for items in accepted[provider]]
-    return [f"campos obrigatórios: {' ou '.join(alternatives)}"]
+    alternatives = REQUIREMENTS[provider]["required"]
+    missing_by_set = [[key for key in required_set if not payload.get(key)] for required_set in alternatives]
+    if any(not missing for missing in missing_by_set):
+        if provider == "GCP" and payload.get("type") != "service_account":
+            return ["O campo type deve ser service_account."]
+        return []
+    closest = min(missing_by_set, key=len)
+    return [f"Campos obrigatórios ausentes para {provider}: {', '.join(closest)}."]
 
 
-def credential_view(row: sqlite3.Row, include_secret: bool = False) -> dict[str, Any]:
-    result = {
+def prepare_credential(provider: str, payload: dict[str, Any]) -> dict[str, Any]:
+    credential = normalize_credential(provider, payload)
+    errors = validate_provider(provider, credential)
+    if errors:
+        raise HTTPException(422, {"provider": provider, "errors": errors})
+    return credential
+
+
+def decrypt_credential(row: Any) -> dict[str, Any]:
+    try:
+        return json.loads(cipher.decrypt(row["encrypted_payload"]).decode())
+    except InvalidToken as exc:
+        raise HTTPException(500, "Não foi possível descriptografar a credencial") from exc
+
+
+def credential_view(row: Any, discovered_scopes: list[dict[str, str]] | None = None) -> dict[str, Any]:
+    """Public view: secrets are never returned once stored."""
+    selected = json.loads(row["scopes_json"]) if row["scopes_json"] else None
+    return {
         "id": row["id"], "name": row["name"], "provider": row["provider"],
-        "scope": row["scope"], "status": row["status"],
+        "kind": row["auth_kind"] or REQUIREMENTS[row["provider"]]["kind"],
+        "principal": row["principal"] or "",
+        "scopes": selected if selected is not None else (discovered_scopes or []),
+        "scopeSelection": "selected" if selected is not None else "all",
+        "scope": row["scope"], "status": row["status"], "lastError": row["last_error"],
+        "expiresAt": row["expires_at"],
         "createdAt": row["created_at"], "updatedAt": row["updated_at"],
         "lastSyncedAt": row["last_synced_at"],
         "synced": row["last_synced_at"] or "Nunca",
     }
-    if include_secret:
-        try:
-            result["credential"] = json.loads(cipher.decrypt(row["encrypted_payload"]).decode())
-        except InvalidToken as exc:
-            raise HTTPException(500, "Não foi possível descriptografar a credencial") from exc
+
+
+def discovered_scopes(connection: DatabaseConnection, credential_id: int | None = None) -> dict[int, list[dict[str, str]]]:
+    filter_sql = " AND r.credential_id=?" if credential_id is not None else ""
+    params: tuple[Any, ...] = (credential_id,) if credential_id is not None else ()
+    rows = connection.execute(
+        f"""SELECT r.credential_id,r.external_id,r.display_name,c.provider FROM cloud_resources r
+            JOIN credentials c ON c.id=r.credential_id
+            WHERE r.resource_type<>'repository'{filter_sql} ORDER BY r.display_name""", params,
+    ).fetchall()
+    result: dict[int, list[dict[str, str]]] = {}
+    for row in rows:
+        result.setdefault(row["credential_id"], []).append(scope_entry(row["provider"], row["external_id"], row["display_name"]))
     return result
+
+
+def single_credential_view(connection: DatabaseConnection, credential_id: int) -> dict[str, Any]:
+    row = connection.execute("SELECT * FROM credentials WHERE id=?", (credential_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Credencial não encontrada")
+    return credential_view(row, discovered_scopes(connection, credential_id).get(credential_id))
 
 
 def audit(connection: DatabaseConnection, event_type: str, title: str, description: str,
@@ -627,67 +685,115 @@ def health() -> dict[str, str]:
 def list_credentials() -> list[dict[str, Any]]:
     with db() as connection:
         rows = connection.execute("SELECT * FROM credentials ORDER BY updated_at DESC").fetchall()
-    return [credential_view(row) for row in rows]
+        scopes = discovered_scopes(connection)
+    return [credential_view(row, scopes.get(row["id"])) for row in rows]
+
+
+@app.get("/api/credentials/requirements")
+def credential_requirements() -> dict[str, Any]:
+    fields = ("kind", "scopeKind", "roles", "required", "checks", "sample")
+    return {"providers": [{"provider": provider, **{key: spec[key] for key in fields}}
+                          for provider, spec in REQUIREMENTS.items()]}
+
+
+@app.post("/api/credentials/validate")
+def validate_credential(payload: CredentialValidation) -> dict[str, Any]:
+    credential = prepare_credential(payload.provider, payload.credential)
+    try:
+        result = probe(payload.provider, credential)
+    except ConnectorError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    kind, _ = describe_credential(payload.provider, credential)
+    return {"provider": payload.provider, "kind": kind, **result}
 
 
 @app.get("/api/credentials/{credential_id}")
 def get_credential(credential_id: int) -> dict[str, Any]:
     with db() as connection:
-        row = connection.execute("SELECT * FROM credentials WHERE id=?", (credential_id,)).fetchone()
-    if not row:
-        raise HTTPException(404, "Credencial não encontrada")
-    return credential_view(row, include_secret=True)
+        return single_credential_view(connection, credential_id)
+
+
+def scopes_json(scopes: list[ScopeInput] | None) -> str | None:
+    if scopes is None:
+        return None
+    if not scopes:
+        raise HTTPException(422, "Selecione ao menos um escopo para analisar.")
+    unique = {item.id: item.model_dump() for item in scopes}
+    return json.dumps(list(unique.values()))
 
 
 @app.post("/api/credentials", status_code=status.HTTP_201_CREATED)
 def create_credential(payload: CredentialInput, request: Request) -> dict[str, Any]:
-    errors = validate_provider(payload.provider, payload.credential)
-    if errors:
-        raise HTTPException(422, {"provider": payload.provider, "errors": errors})
+    credential = prepare_credential(payload.provider, payload.credential)
+    kind, principal = describe_credential(payload.provider, credential)
+    selected = scopes_json(payload.scopes)
     now = utc_now()
-    encrypted = cipher.encrypt(json.dumps(payload.credential).encode())
+    encrypted = cipher.encrypt(json.dumps(credential).encode())
     with db() as connection:
         cursor = connection.execute(
-            "INSERT INTO credentials(name,provider,encrypted_payload,scope,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?) RETURNING id",
-            (payload.name, payload.provider, encrypted, "Ainda não analisado", "Pendente", now, now),
+            """INSERT INTO credentials(name,provider,encrypted_payload,scope,status,auth_kind,principal,scopes_json,
+               expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) RETURNING id""",
+            (payload.name, payload.provider, encrypted, "Ainda não analisado", "Pendente", kind, principal, selected,
+             aws_expiry(credential) if payload.provider == "AWS" else None, now, now),
         )
         credential_id = cursor.fetchone()["id"]
-        audit(connection, "credential", "Credencial adicionada", f"{payload.name} ({payload.provider}) aguarda a primeira análise real.", request.state.user["email"])
-        row = connection.execute("SELECT * FROM credentials WHERE id=?", (credential_id,)).fetchone()
-    return credential_view(row)
+        scope_text = f"{len(payload.scopes)} escopo(s) selecionado(s)" if payload.scopes else "todos os escopos visíveis"
+        audit(connection, "credential", "Credencial adicionada",
+              f"{payload.name} ({payload.provider}) aguarda a primeira análise real em {scope_text}.", request.state.user["email"])
+        return single_credential_view(connection, credential_id)
 
 
 @app.put("/api/credentials/{credential_id}")
-def update_credential(credential_id: int, payload: CredentialInput, request: Request) -> dict[str, Any]:
-    errors = validate_provider(payload.provider, payload.credential)
-    if errors:
-        raise HTTPException(422, {"provider": payload.provider, "errors": errors})
+def update_credential(credential_id: int, payload: CredentialUpdate, request: Request) -> dict[str, Any]:
     with db() as connection:
-        exists = connection.execute("SELECT id FROM credentials WHERE id=?", (credential_id,)).fetchone()
-        if not exists:
+        row = connection.execute("SELECT * FROM credentials WHERE id=?", (credential_id,)).fetchone()
+        if not row:
             raise HTTPException(404, "Credencial não encontrada")
+        if payload.credential is None and payload.provider != row["provider"]:
+            raise HTTPException(422, "Informe uma nova credencial JSON ao trocar o provedor.")
+        selected = scopes_json(payload.scopes) if payload.scopes is not None else row["scopes_json"]
+        if payload.credential is None and selected == row["scopes_json"]:
+            connection.execute("UPDATE credentials SET name=?,updated_at=? WHERE id=?", (payload.name, utc_now(), credential_id))
+            if payload.name != row["name"]:
+                audit(connection, "credential", "Credencial renomeada", f"{row['name']} → {payload.name}.", request.state.user["email"])
+            return single_credential_view(connection, credential_id)
+        if payload.credential is not None:
+            credential = prepare_credential(payload.provider, payload.credential)
+            kind, principal = describe_credential(payload.provider, credential)
+            encrypted = cipher.encrypt(json.dumps(credential).encode())
+            expires_at = aws_expiry(credential) if payload.provider == "AWS" else None
+        else:
+            kind, principal, encrypted, expires_at = row["auth_kind"], row["principal"], row["encrypted_payload"], row["expires_at"]
         connection.execute("DELETE FROM scans WHERE credential_id=?", (credential_id,))
         connection.execute("DELETE FROM identities WHERE credential_id=?", (credential_id,))
         connection.execute("DELETE FROM access_grants WHERE credential_id=?", (credential_id,))
         connection.execute("DELETE FROM cloud_resources WHERE credential_id=?", (credential_id,))
         connection.execute(
-            "UPDATE credentials SET name=?,provider=?,encrypted_payload=?,scope=?,status=?,last_synced_at=NULL,updated_at=? WHERE id=?",
-            (payload.name, payload.provider, cipher.encrypt(json.dumps(payload.credential).encode()),
-             "Ainda não analisado", "Pendente", utc_now(), credential_id),
+            """UPDATE credentials SET name=?,provider=?,encrypted_payload=?,scope=?,status=?,auth_kind=?,principal=?,
+               scopes_json=?,last_error=NULL,expires_at=?,last_synced_at=NULL,updated_at=? WHERE id=?""",
+            (payload.name, payload.provider, encrypted, "Ainda não analisado", "Pendente", kind, principal,
+             selected, expires_at, utc_now(), credential_id),
         )
         audit(connection, "credential", "Credencial atualizada", f"{payload.name} aguarda uma nova análise real.", request.state.user["email"])
-        row = connection.execute("SELECT * FROM credentials WHERE id=?", (credential_id,)).fetchone()
-    return credential_view(row)
+        return single_credential_view(connection, credential_id)
 
 
 @app.delete("/api/credentials/{credential_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_credential(credential_id: int, request: Request) -> Response:
     with db() as connection:
-        row = connection.execute("SELECT name FROM credentials WHERE id=?", (credential_id,)).fetchone()
+        row = connection.execute("SELECT name,provider FROM credentials WHERE id=?", (credential_id,)).fetchone()
         if not row:
             raise HTTPException(404, "Credencial não encontrada")
+        severities = connection.execute(
+            "SELECT severity,COUNT(*) count FROM findings WHERE credential_id=? AND status='open' GROUP BY severity",
+            (credential_id,),
+        ).fetchall()
+        labels = {"critical": "crítico(s)", "high": "alto(s)", "medium": "médio(s)", "low": "baixo(s)"}
+        summary = ", ".join(f"{item['count']} {labels.get(item['severity'], item['severity'])}" for item in severities)
         connection.execute("DELETE FROM credentials WHERE id=?", (credential_id,))
-        audit(connection, "credential", "Credencial removida", f"{row['name']} foi desconectada do ambiente.", request.state.user["email"])
+        audit(connection, "credential", "Credencial removida",
+              f"{row['name']} ({row['provider']}) foi desconectada do ambiente. "
+              f"Achados abertos no momento da remoção: {summary or 'nenhum'}.", request.state.user["email"])
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -768,16 +874,14 @@ def scan_credential(credential_id: int, request: Request) -> dict[str, Any]:
         row = connection.execute("SELECT * FROM credentials WHERE id=?", (credential_id,)).fetchone()
         if not row:
             raise HTTPException(404, "Credencial não encontrada")
+        credential = decrypt_credential(row)
+        selected_scopes = [item["id"] for item in json.loads(row["scopes_json"])] if row["scopes_json"] else None
         try:
-            credential = json.loads(cipher.decrypt(row["encrypted_payload"]).decode())
-        except InvalidToken as exc:
-            raise HTTPException(500, "Não foi possível descriptografar a credencial") from exc
-        try:
-            discovered = discover(row["provider"], credential)
+            discovered = discover(row["provider"], credential, scopes=selected_scopes)
         except ConnectorError as exc:
             connection.execute(
-                "UPDATE credentials SET status=?,updated_at=? WHERE id=?",
-                ("Erro", utc_now(), credential_id),
+                "UPDATE credentials SET status=?,last_error=?,updated_at=? WHERE id=?",
+                ("Erro", str(exc), utc_now(), credential_id),
             )
             audit(connection, "credential", "Falha na análise cloud", f"{row['name']}: {exc}", request.state.user["email"])
             connection.commit()
@@ -834,8 +938,10 @@ def scan_credential(credential_id: int, request: Request) -> dict[str, Any]:
         )
         scope = f"{len(projects)} projetos/contas · {len(identities)} identidades · {len(accesses)} acessos"
         connection.execute(
-            "UPDATE credentials SET scope=?,status=?,last_synced_at=?,updated_at=? WHERE id=?",
-            (scope, "Conectado", finished_at, finished_at, credential_id),
+            """UPDATE credentials SET scope=?,status=?,last_error=NULL,expires_at=?,principal=COALESCE(?,principal),
+               last_synced_at=?,updated_at=? WHERE id=?""",
+            (scope, "Conectado", discovered.get("expiresAt") or row["expires_at"], discovered.get("principal"),
+             finished_at, finished_at, credential_id),
         )
         audit(connection, "risk", "Análise de acesso concluída",
               f"{row['name']}: {len(identities)} identidades, {len(accesses)} acessos e {len(findings)} riscos.", request.state.user["email"])

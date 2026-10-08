@@ -73,7 +73,7 @@ Depois acesse `http://localhost:8080`. Nesse modo a API, o login e o banco não 
 
 ## Segurança e operação
 
-As credenciais são validadas por provedor, criptografadas antes de serem persistidas e nunca retornam nos endpoints de listagem. Para editar, a API descriptografa somente o registro solicitado. O volume Docker `postgres-data` mantém o PostgreSQL entre reinicializações.
+As credenciais são validadas por provedor, criptografadas antes de serem persistidas e nunca voltam a ser exibidas: nenhum endpoint devolve o JSON secreto depois de gravado. Para editar, informe uma nova credencial ou deixe o campo em branco para manter a atual (renomear não invalida a última análise). O volume Docker `postgres-data` mantém o PostgreSQL entre reinicializações.
 
 Os valores padrão servem apenas para desenvolvimento. Em produção, injete senhas fortes e segredos por secret manager; não altere `CREDENTIAL_MASTER_KEY` enquanto existirem credenciais gravadas. Uma implantação pública também deve usar TLS, isolamento por tenant e um cofre gerenciado (AWS Secrets Manager, Azure Key Vault ou GCP Secret Manager).
 
@@ -89,6 +89,8 @@ Os conectores solicitam operações de leitura e toleram permissões opcionais i
 
 Endpoints de consulta:
 
+- `GET /api/credentials/requirements` (campos aceitos, permissões mínimas e modelo de JSON por provedor)
+- `POST /api/credentials/validate` (teste de leitura sem gravar: identidade, escopos visíveis e permissões verificadas)
 - `POST /api/credentials/{id}/scan`
 - `GET /api/identities`
 - `GET /api/accesses`
@@ -104,4 +106,6 @@ Endpoints de consulta:
 
 Cada análise persiste a nota de postura calculada. O dashboard apresenta a evolução histórica consolidada ou filtrada por integração, permitindo comparar a postura antes e depois das remediações.
 
-Ao cadastrar ou editar uma credencial, seu estado permanece pendente e os dados anteriores são invalidados. Somente uma coleta concluída altera a integração para conectada e preenche dashboard, inventários, riscos, UEBA, acesso privilegiado e compliance.
+O cadastro segue o fluxo **Validar credencial → selecionar escopos → Salvar**: a validação consulta o provedor em modo leitura, lista os projetos, contas ou assinaturas visíveis e confere as permissões obrigatórias e opcionais. Somente os escopos selecionados são analisados, e a primeira análise começa automaticamente após salvar. A tela de credenciais sinaliza falhas da última análise com a mensagem do conector e credenciais que expiram em até 15 dias (validade da chave GCP, do segredo Azure via Graph ou campo `Expiration` de credenciais AWS temporárias).
+
+Ao trocar a credencial ou os escopos, seu estado volta a pendente e os dados anteriores são invalidados. Somente uma coleta concluída altera a integração para conectada e preenche dashboard, inventários, riscos, UEBA, acesso privilegiado e compliance.

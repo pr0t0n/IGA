@@ -9,6 +9,72 @@ class ConnectorError(Exception):
     """Safe error raised when a cloud discovery cannot be completed."""
 
 
+GCP_TOKEN_URI = "https://oauth2.googleapis.com/token"
+
+# Single source of truth for what each connector needs: accepted JSON field sets,
+# the roles to grant, the permissions probed before saving and a template payload.
+REQUIREMENTS: dict[str, dict[str, Any]] = {
+    "GCP": {
+        "kind": "Service account (JSON)",
+        "scopeKind": "Projeto",
+        "roles": ["roles/iam.securityReviewer", "roles/browser", "roles/logging.viewer"],
+        "required": [["type", "project_id", "private_key", "client_email"]],
+        "checks": [
+            {"permission": "resourcemanager.projects.get", "required": True},
+            {"permission": "resourcemanager.projects.getIamPolicy", "required": True},
+            {"permission": "logging.logEntries.list", "required": False},
+            {"permission": "source.repos.list", "required": False},
+            {"permission": "iam.serviceAccountKeys.get", "required": False},
+        ],
+        "sample": {
+            "type": "service_account", "project_id": "meu-projeto", "private_key_id": "…",
+            "private_key": "-----BEGIN PRIVATE KEY-----\n…\n-----END PRIVATE KEY-----\n",
+            "client_email": "iga-reader@meu-projeto.iam.gserviceaccount.com", "client_id": "…",
+            "token_uri": GCP_TOKEN_URI,
+        },
+    },
+    "AWS": {
+        "kind": "IAM Role ou access key",
+        "scopeKind": "Conta",
+        "roles": ["SecurityAudit", "IAMReadOnlyAccess", "organizations:ListAccounts"],
+        "required": [
+            ["accessKeyId", "secretAccessKey"],
+            ["aws_access_key_id", "aws_secret_access_key"],
+            ["accountId", "roleArn"],
+        ],
+        "checks": [
+            {"permission": "sts:GetCallerIdentity", "required": True},
+            {"permission": "iam:ListUsers", "required": True},
+            {"permission": "iam:ListRoles", "required": True},
+            {"permission": "organizations:ListAccounts", "required": False},
+        ],
+        "sample": {
+            "accessKeyId": "AKIA…", "secretAccessKey": "…",
+            "roleArn": "arn:aws:iam::123456789012:role/NexoIGAAudit", "externalId": "…", "region": "us-east-1",
+        },
+    },
+    "Azure": {
+        "kind": "App registration",
+        "scopeKind": "Assinatura",
+        "roles": ["Reader (assinaturas)", "Microsoft.Authorization/*/read", "Application.Read.All (opcional)"],
+        "required": [["tenantId", "clientId", "clientSecret"], ["tenant_id", "client_id", "client_secret"]],
+        "checks": [
+            {"permission": "Microsoft.Resources/subscriptions/read", "required": True},
+            {"permission": "Microsoft.Authorization/roleDefinitions/read", "required": True},
+            {"permission": "Microsoft.Authorization/roleAssignments/read", "required": True},
+            {"permission": "Application.Read.All", "required": False},
+        ],
+        "sample": {"tenantId": "00000000-0000-0000-0000-000000000000", "clientId": "…", "clientSecret": "…"},
+    },
+}
+
+AWS_KEY_ALIASES = {
+    "AccessKeyId": "accessKeyId", "SecretAccessKey": "secretAccessKey", "SessionToken": "sessionToken",
+    "RoleArn": "roleArn", "ExternalId": "externalId", "Region": "region", "AccountId": "accountId",
+    "Expiration": "expiration",
+}
+
+
 def iso(value: Any) -> str | None:
     if isinstance(value, datetime):
         if value.tzinfo is None:
@@ -17,20 +83,116 @@ def iso(value: Any) -> str | None:
     return str(value) if value else None
 
 
-def discover(provider: str, credential: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+def parse_iso(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if not value or not isinstance(value, str):
+        return None
     try:
-        if provider == "AWS":
-            return discover_aws(credential)
-        if provider == "Azure":
-            return discover_azure(credential)
-        if provider == "GCP":
-            return discover_gcp(credential)
-        raise ConnectorError(f"Provedor não suportado: {provider}")
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def normalize_credential(provider: str, credential: dict[str, Any]) -> dict[str, Any]:
+    """Accept the formats emitted by the provider CLIs (e.g. `aws sts` PascalCase output)."""
+    if provider != "AWS":
+        return dict(credential)
+    source = credential.get("Credentials") if isinstance(credential.get("Credentials"), dict) else credential
+    normalized = {AWS_KEY_ALIASES.get(key, key): value for key, value in source.items()}
+    for key, value in credential.items():
+        if key != "Credentials":
+            normalized.setdefault(AWS_KEY_ALIASES.get(key, key), value)
+    return normalized
+
+
+def mask(value: str) -> str:
+    return value if len(value) <= 8 else f"{value[:4]}…{value[-4:]}"
+
+
+def describe_credential(provider: str, credential: dict[str, Any]) -> tuple[str, str]:
+    """Non-secret description (kind, principal) safe to persist and list."""
+    if provider == "GCP":
+        return REQUIREMENTS["GCP"]["kind"], str(credential.get("client_email", ""))
+    if provider == "AWS":
+        if credential.get("roleArn"):
+            return "IAM Role (AssumeRole)", str(credential["roleArn"])
+        access_key = str(credential.get("accessKeyId") or credential.get("aws_access_key_id") or "")
+        return "Access key (IAM)", mask(access_key)
+    tenant = credential.get("tenantId") or credential.get("tenant_id") or ""
+    return REQUIREMENTS["Azure"]["kind"], f"tenant {tenant}"
+
+
+def scope_entry(provider: str, scope_id: Any, name: Any = None) -> dict[str, str]:
+    scope_id = str(scope_id)
+    name = str(name) if name else scope_id
+    if provider == "GCP":
+        label = scope_id
+    elif provider == "AWS":
+        label = f"{scope_id} · {name}" if name != scope_id else scope_id
+    else:
+        label = name
+    return {"id": scope_id, "name": name, "label": label}
+
+
+def guarded(provider: str, operation, *args, **kwargs):
+    try:
+        return operation(*args, **kwargs)
     except ConnectorError:
         raise
     except Exception as exc:
         name = type(exc).__name__
         raise ConnectorError(f"Falha de autenticação ou autorização no conector {provider} ({name}).") from exc
+
+
+def discover(provider: str, credential: dict[str, Any], scopes: list[str] | None = None) -> dict[str, list[dict[str, Any]]]:
+    connectors = {"AWS": discover_aws, "Azure": discover_azure, "GCP": discover_gcp}
+    if provider not in connectors:
+        raise ConnectorError(f"Provedor não suportado: {provider}")
+    return guarded(provider, connectors[provider], credential, scopes)
+
+
+def probe(provider: str, credential: dict[str, Any]) -> dict[str, Any]:
+    """Read-only access check run before a credential is saved."""
+    probes = {"AWS": probe_aws, "Azure": probe_azure, "GCP": probe_gcp}
+    if provider not in probes:
+        raise ConnectorError(f"Provedor não suportado: {provider}")
+    return guarded(provider, probes[provider], credential)
+
+
+def succeeds(operation) -> bool:
+    try:
+        operation()
+        return True
+    except Exception:
+        return False
+
+
+def probe_result(provider: str, identity: str, scopes: list[dict[str, str]], granted: set[str],
+                 expires_at: str | None) -> dict[str, Any]:
+    checks = [{**item, "granted": item["permission"] in granted} for item in REQUIREMENTS[provider]["checks"]]
+    missing = [item["permission"] for item in checks if item["required"] and not item["granted"]]
+    if missing:
+        raise ConnectorError(f"Permissão obrigatória ausente: {', '.join(missing)}.")
+    if not scopes:
+        raise ConnectorError(f"Nenhum escopo ({REQUIREMENTS[provider]['scopeKind'].lower()}) visível para esta credencial.")
+    return {"identity": identity, "scopes": scopes, "checks": checks, "expiresAt": expires_at}
+
+
+def restrict(items: list[Any], wanted: list[str] | None, key, provider: str) -> list[Any]:
+    if not wanted:
+        return items
+    selected = [item for item in items if str(key(item)) in set(wanted)]
+    if not selected:
+        kind = REQUIREMENTS[provider]["scopeKind"].lower()
+        raise ConnectorError(f"Nenhum escopo selecionado ({kind}) continua acessível para esta credencial.")
+    return selected
+
+
+def aws_expiry(credential: dict[str, Any]) -> str | None:
+    parsed = parse_iso(credential.get("expiration"))
+    return parsed.isoformat() if parsed else None
 
 
 def aws_session(credential: dict[str, Any]):
@@ -60,7 +222,34 @@ def aws_session(credential: dict[str, Any]):
     return base
 
 
-def discover_aws(credential: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+def aws_accounts(session, account_id: str) -> tuple[list[dict[str, Any]], bool]:
+    try:
+        organizations = session.client("organizations")
+        accounts = [{"id": item["Id"], "name": item["Name"], "type": "account"}
+                    for page in organizations.get_paginator("list_accounts").paginate()
+                    for item in page.get("Accounts", []) if item.get("Status") == "ACTIVE"]
+        return accounts or [{"id": account_id, "name": f"AWS Account {account_id}", "type": "account"}], True
+    except Exception:
+        return [{"id": account_id, "name": f"AWS Account {account_id}", "type": "account"}], False
+
+
+def probe_aws(credential: dict[str, Any]) -> dict[str, Any]:
+    session = aws_session(credential)
+    caller = session.client("sts").get_caller_identity()
+    iam = session.client("iam")
+    granted = {"sts:GetCallerIdentity"}
+    if succeeds(lambda: iam.list_users(MaxItems=1)):
+        granted.add("iam:ListUsers")
+    if succeeds(lambda: iam.list_roles(MaxItems=1)):
+        granted.add("iam:ListRoles")
+    accounts, organizations_readable = aws_accounts(session, caller["Account"])
+    if organizations_readable:
+        granted.add("organizations:ListAccounts")
+    scopes = [scope_entry("AWS", item["id"], item["name"]) for item in accounts]
+    return probe_result("AWS", caller["Arn"], scopes, granted, aws_expiry(credential))
+
+
+def discover_aws(credential: dict[str, Any], scopes: list[str] | None = None) -> dict[str, list[dict[str, Any]]]:
     session = aws_session(credential)
     sts = session.client("sts")
     caller = sts.get_caller_identity()
@@ -109,27 +298,73 @@ def discover_aws(credential: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
                     "privileged": "admin" in policy["PolicyName"].lower(), "grantedAt": iso(role.get("CreateDate")),
                 })
 
-    projects = [{"id": account_id, "name": f"AWS Account {account_id}", "type": "account"}]
+    projects, _ = aws_accounts(session, account_id)
+    projects = restrict(projects, scopes, lambda item: item["id"], "AWS")
+    return {"identities": identities, "accesses": accesses, "events": [], "projects": projects,
+            "principal": caller.get("Arn"), "expiresAt": aws_expiry(credential)}
+
+
+def azure_parts(credential: dict[str, Any]) -> tuple[str, str, str]:
+    tenant = credential.get("tenantId") or credential.get("tenant_id")
+    client = credential.get("clientId") or credential.get("client_id")
+    secret = credential.get("clientSecret") or credential.get("client_secret")
+    return tenant, client, secret
+
+
+def azure_secret_expiry(token: Any, client: str, secret: str) -> tuple[str | None, bool]:
+    """Expiry of the client secret in use (matched by Graph's 3-char hint); needs Application.Read.All."""
+    import requests
+
     try:
-        organizations = session.client("organizations")
-        projects = [{"id": item["Id"], "name": item["Name"], "type": "account"}
-                    for page in organizations.get_paginator("list_accounts").paginate()
-                    for item in page.get("Accounts", []) if item.get("Status") == "ACTIVE"] or projects
+        access = token.get_token("https://graph.microsoft.com/.default").token
+        response = requests.get(
+            f"https://graph.microsoft.com/v1.0/applications(appId='{client}')",
+            params={"$select": "passwordCredentials"}, headers={"Authorization": f"Bearer {access}"}, timeout=15,
+        )
     except Exception:
-        pass
-    return {"identities": identities, "accesses": accesses, "events": [], "projects": projects}
+        return None, False
+    if not response.ok:
+        return None, False
+    for item in response.json().get("passwordCredentials", []):
+        if item.get("hint") and str(secret).startswith(item["hint"]):
+            parsed = parse_iso(item.get("endDateTime"))
+            return (parsed.isoformat() if parsed else None), True
+    return None, True
 
 
-def discover_azure(credential: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+def probe_azure(credential: dict[str, Any]) -> dict[str, Any]:
     from azure.identity import ClientSecretCredential
     from azure.mgmt.authorization import AuthorizationManagementClient
     from azure.mgmt.resource import SubscriptionClient
 
-    tenant = credential.get("tenantId") or credential.get("tenant_id")
-    client = credential.get("clientId") or credential.get("client_id")
-    secret = credential.get("clientSecret") or credential.get("client_secret")
+    tenant, client, secret = azure_parts(credential)
     token = ClientSecretCredential(tenant_id=tenant, client_id=client, client_secret=secret)
     subscriptions = list(SubscriptionClient(token).subscriptions.list())
+    granted: set[str] = set()
+    if subscriptions:
+        granted.add("Microsoft.Resources/subscriptions/read")
+        first = f"/subscriptions/{subscriptions[0].subscription_id}"
+        auth = AuthorizationManagementClient(token, subscriptions[0].subscription_id)
+        if succeeds(lambda: next(iter(auth.role_definitions.list(scope=first)), None)):
+            granted.add("Microsoft.Authorization/roleDefinitions/read")
+        if succeeds(lambda: next(iter(auth.role_assignments.list_for_scope(scope=first)), None)):
+            granted.add("Microsoft.Authorization/roleAssignments/read")
+    expires_at, graph_readable = azure_secret_expiry(token, client, secret)
+    if graph_readable:
+        granted.add("Application.Read.All")
+    scopes = [scope_entry("Azure", item.subscription_id, item.display_name) for item in subscriptions]
+    return probe_result("Azure", f"tenant {tenant}", scopes, granted, expires_at)
+
+
+def discover_azure(credential: dict[str, Any], scopes: list[str] | None = None) -> dict[str, list[dict[str, Any]]]:
+    from azure.identity import ClientSecretCredential
+    from azure.mgmt.authorization import AuthorizationManagementClient
+    from azure.mgmt.resource import SubscriptionClient
+
+    tenant, client, secret = azure_parts(credential)
+    token = ClientSecretCredential(tenant_id=tenant, client_id=client, client_secret=secret)
+    subscriptions = restrict(list(SubscriptionClient(token).subscriptions.list()), scopes,
+                             lambda item: item.subscription_id, "Azure")
     identities_by_id: dict[str, dict[str, Any]] = {}
     accesses: list[dict[str, Any]] = []
     projects: list[dict[str, Any]] = []
@@ -153,18 +388,37 @@ def discover_azure(credential: dict[str, Any]) -> dict[str, list[dict[str, Any]]
                 "role": role_name, "permissions": [role_name],
                 "privileged": role_name.lower() in {"owner", "user access administrator", "contributor"},
             })
-    return {"identities": list(identities_by_id.values()), "accesses": accesses, "events": [], "projects": projects}
+    expires_at, _ = azure_secret_expiry(token, client, secret)
+    return {"identities": list(identities_by_id.values()), "accesses": accesses, "events": [], "projects": projects,
+            "principal": f"tenant {tenant}", "expiresAt": expires_at}
 
 
-def discover_gcp(credential: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+def gcp_session(credential: dict[str, Any]):
     from google.auth.transport.requests import AuthorizedSession
     from google.oauth2 import service_account
 
     connector_options = {"organizationId", "projectQuery"}
     info = {key: value for key, value in credential.items() if key not in connector_options}
-    scopes = ["https://www.googleapis.com/auth/cloud-platform.read-only"]
-    credentials = service_account.Credentials.from_service_account_info(info, scopes=scopes)
-    session = AuthorizedSession(credentials)
+    info.setdefault("token_uri", GCP_TOKEN_URI)
+    oauth_scopes = ["https://www.googleapis.com/auth/cloud-platform.read-only"]
+    credentials = service_account.Credentials.from_service_account_info(info, scopes=oauth_scopes)
+    return credentials, AuthorizedSession(credentials)
+
+
+def gcp_key_expiry(session: Any, credential: dict[str, Any]) -> str | None:
+    """validBeforeTime of the key in use; user-managed keys without expiry report year 9999."""
+    key_id, email = credential.get("private_key_id"), credential.get("client_email")
+    if not key_id or not email:
+        return None
+    try:
+        response = session.get(f"https://iam.googleapis.com/v1/projects/-/serviceAccounts/{email}/keys/{key_id}", timeout=15)
+        parsed = parse_iso(response.json().get("validBeforeTime")) if response.ok else None
+    except Exception:
+        return None
+    return parsed.isoformat() if parsed and parsed.year < 9999 else None
+
+
+def gcp_list_projects(session: Any, credential: dict[str, Any]) -> tuple[list[dict[str, Any]], int | None]:
     query = credential.get("projectQuery", "state:ACTIVE")
     if credential.get("organizationId") and "parent:" not in query:
         query = f"parent:organizations/{credential['organizationId']} {query}"
@@ -202,11 +456,39 @@ def discover_gcp(credential: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
             }]
         else:
             projects_raw = [{"projectId": configured_project, "displayName": configured_project}]
+    return projects_raw, search_status
+
+
+def probe_gcp(credential: dict[str, Any]) -> dict[str, Any]:
+    _, session = gcp_session(credential)
+    projects_raw, search_status = gcp_list_projects(session, credential)
     if not projects_raw:
         raise ConnectorError(
             f"GCP Resource Manager não retornou projetos acessíveis (HTTP {search_status}). "
             "Conceda resourcemanager.projects.get/list à service account."
         )
+    configured = credential.get("project_id")
+    target = configured if any(item["projectId"] == configured for item in projects_raw) else projects_raw[0]["projectId"]
+    response = session.post(
+        f"https://cloudresourcemanager.googleapis.com/v1/projects/{target}:testIamPermissions",
+        json={"permissions": [item["permission"] for item in REQUIREMENTS["GCP"]["checks"]]}, timeout=20,
+    )
+    granted = set(response.json().get("permissions", [])) if response.ok else set()
+    scopes = [scope_entry("GCP", item["projectId"], item.get("displayName")) for item in projects_raw]
+    return probe_result("GCP", str(credential.get("client_email", "")), scopes, granted, gcp_key_expiry(session, credential))
+
+
+def discover_gcp(credential: dict[str, Any], scopes: list[str] | None = None) -> dict[str, list[dict[str, Any]]]:
+    from google.auth.transport.requests import AuthorizedSession
+
+    credentials, session = gcp_session(credential)
+    projects_raw, search_status = gcp_list_projects(session, credential)
+    if not projects_raw:
+        raise ConnectorError(
+            f"GCP Resource Manager não retornou projetos acessíveis (HTTP {search_status}). "
+            "Conceda resourcemanager.projects.get/list à service account."
+        )
+    projects_raw = restrict(projects_raw, scopes, lambda item: item["projectId"], "GCP")
     identities_by_id: dict[str, dict[str, Any]] = {}
     accesses: list[dict[str, Any]] = []
     projects: list[dict[str, Any]] = []
@@ -338,4 +620,5 @@ def discover_gcp(credential: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     elif telemetry_http_statuses:
         telemetry_status = "partial"
     return {"identities": list(identities_by_id.values()), "accesses": accesses, "events": events, "projects": projects,
-            "telemetryStatus": telemetry_status, "telemetryHttpStatuses": sorted(telemetry_http_statuses)}
+            "telemetryStatus": telemetry_status, "telemetryHttpStatuses": sorted(telemetry_http_statuses),
+            "principal": credential.get("client_email"), "expiresAt": gcp_key_expiry(session, credential)}

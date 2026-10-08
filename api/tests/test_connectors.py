@@ -102,6 +102,90 @@ class ConnectorNormalizationTest(unittest.TestCase):
         self.assertTrue(any(item["resourceName"] == "platform-api" for item in result["accesses"]))
         self.assertEqual(session.get.call_args_list[0].kwargs["params"]["query"], "state:ACTIVE")
 
+    @patch("google.auth.transport.requests.AuthorizedSession")
+    @patch("google.oauth2.service_account.Credentials.from_service_account_info")
+    def test_gcp_discovery_restricted_to_selected_scopes(self, credential_factory, session_class):
+        credential_factory.return_value = object()
+        session = session_class.return_value
+        session.get.return_value = FakeResponse({"projects": [
+            {"projectId": "data-prod", "displayName": "Data Production"},
+            {"projectId": "data-dev", "displayName": "Data Development"},
+        ]})
+        session.post.return_value = FakeResponse({"bindings": [{"role": "roles/viewer", "members": ["user:bob@example.com"]}]})
+        credential = {"type": "service_account", "project_id": "data-prod", "private_key": "test",
+                      "client_email": "reader@data-prod.iam.gserviceaccount.com"}
+
+        result = connectors.discover_gcp(credential, scopes=["data-dev"])
+        self.assertEqual([item["id"] for item in result["projects"]], ["data-dev"])
+        self.assertEqual({item["resourceId"] for item in result["accesses"]}, {"data-dev"})
+        self.assertEqual(credential_factory.call_args.args[0]["token_uri"], connectors.GCP_TOKEN_URI)
+        with self.assertRaises(connectors.ConnectorError):
+            connectors.discover_gcp(credential, scopes=["missing-project"])
+
+    @patch("google.auth.transport.requests.AuthorizedSession")
+    @patch("google.oauth2.service_account.Credentials.from_service_account_info")
+    def test_gcp_probe_reports_granted_permissions(self, credential_factory, session_class):
+        credential_factory.return_value = object()
+        session = session_class.return_value
+        session.get.side_effect = [
+            FakeResponse({"projects": [{"projectId": "data-prod", "displayName": "Data Production"}]}),
+            FakeResponse({"validBeforeTime": "2027-01-31T00:00:00Z"}),
+        ]
+        session.post.return_value = FakeResponse({"permissions": [
+            "resourcemanager.projects.get", "resourcemanager.projects.getIamPolicy", "logging.logEntries.list",
+        ]})
+        result = connectors.probe("GCP", {
+            "type": "service_account", "project_id": "data-prod", "private_key": "test", "private_key_id": "key-1",
+            "client_email": "reader@data-prod.iam.gserviceaccount.com",
+        })
+        self.assertEqual(result["identity"], "reader@data-prod.iam.gserviceaccount.com")
+        self.assertEqual(result["scopes"], [{"id": "data-prod", "name": "Data Production", "label": "data-prod"}])
+        granted = {item["permission"]: item["granted"] for item in result["checks"]}
+        self.assertTrue(granted["logging.logEntries.list"])
+        self.assertFalse(granted["source.repos.list"])
+        self.assertTrue(result["expiresAt"].startswith("2027-01-31"))
+
+        session.get.side_effect = [FakeResponse({"projects": [{"projectId": "data-prod"}]})]
+        session.post.return_value = FakeResponse({"permissions": ["resourcemanager.projects.get"]})
+        with self.assertRaisesRegex(connectors.ConnectorError, "getIamPolicy"):
+            connectors.probe("GCP", {"type": "service_account", "project_id": "data-prod", "private_key": "test",
+                                     "client_email": "reader@data-prod.iam.gserviceaccount.com"})
+
+    @patch("connectors.aws_session")
+    def test_aws_probe_checks_required_and_optional_permissions(self, session_factory):
+        session = MagicMock()
+        session_factory.return_value = session
+        sts = MagicMock()
+        sts.get_caller_identity.return_value = {"Account": "123456789012", "Arn": "arn:aws:iam::123456789012:user/reader"}
+        iam = MagicMock()
+        organizations = MagicMock()
+        organizations.get_paginator.side_effect = Exception("AccessDenied")
+        session.client.side_effect = lambda name: {"sts": sts, "iam": iam, "organizations": organizations}[name]
+
+        result = connectors.probe("AWS", {"accessKeyId": "AKIA", "secretAccessKey": "secret", "expiration": "2030-01-01T00:00:00Z"})
+        self.assertEqual(result["identity"], "arn:aws:iam::123456789012:user/reader")
+        self.assertEqual(result["scopes"][0]["id"], "123456789012")
+        granted = {item["permission"]: item["granted"] for item in result["checks"]}
+        self.assertTrue(granted["iam:ListUsers"])
+        self.assertFalse(granted["organizations:ListAccounts"])
+        self.assertTrue(result["expiresAt"].startswith("2030-01-01"))
+
+        iam.list_users.side_effect = Exception("AccessDenied")
+        with self.assertRaisesRegex(connectors.ConnectorError, "iam:ListUsers"):
+            connectors.probe("AWS", {"accessKeyId": "AKIA", "secretAccessKey": "secret"})
+
+    def test_credential_normalization_and_description(self):
+        normalized = connectors.normalize_credential("AWS", {"Credentials": {
+            "AccessKeyId": "AKIAEXAMPLE12345678", "SecretAccessKey": "secret", "Expiration": "2030-01-01T00:00:00Z",
+        }, "RoleArn": "arn:aws:iam::123456789012:role/Audit"})
+        self.assertEqual(normalized["accessKeyId"], "AKIAEXAMPLE12345678")
+        self.assertEqual(normalized["roleArn"], "arn:aws:iam::123456789012:role/Audit")
+        self.assertEqual(connectors.describe_credential("AWS", normalized), ("IAM Role (AssumeRole)", "arn:aws:iam::123456789012:role/Audit"))
+        self.assertEqual(connectors.describe_credential("AWS", {"accessKeyId": "AKIAEXAMPLE12345678"})[1], "AKIA…5678")
+        self.assertEqual(connectors.describe_credential("Azure", {"tenantId": "tenant-1"}), ("App registration", "tenant tenant-1"))
+        self.assertEqual(connectors.scope_entry("AWS", "123", "prod")["label"], "123 · prod")
+        self.assertEqual(connectors.scope_entry("Azure", "sub-1", "ERP")["label"], "ERP")
+
 
 if __name__ == "__main__":
     unittest.main()

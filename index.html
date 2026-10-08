@@ -7,10 +7,11 @@
   <title>Nexo IGA</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="styles.css?v=20261007-dimensions">
+  <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;800&family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css?v=20261007-credentials">
+  <link rel="stylesheet" href="modernist.css?v=20261007-credentials">
 </head>
-<body>
+<body data-page="dashboard">
   <aside class="sidebar" aria-label="Navegação principal">
     <div class="brand"><span class="brand-mark">N</span><span>Nexo<span class="muted">IGA</span></span></div>
     <nav id="main-nav">
@@ -37,6 +38,7 @@
   <main>
     <header class="topbar">
       <div class="mobile-brand"><span class="brand-mark">N</span> Nexo IGA</div>
+      <div class="breadcrumb" id="breadcrumb" aria-label="Você está em"><span id="breadcrumb-section">Visão geral</span><span class="breadcrumb-sep" aria-hidden="true">/</span><strong id="breadcrumb-page">Postura de acesso</strong></div>
       <div class="top-actions">
         <label class="search"><span>⌕</span><input id="global-search" placeholder="Buscar identidade, recurso ou risco..."></label>
         <button class="icon-btn" aria-label="Notificações">♢<span class="notification-dot"></span></button>
@@ -94,10 +96,34 @@
       </div>
     </section>
 
-    <section id="credenciais" class="page">
-      <div class="page-heading"><div><p class="eyebrow">INTEGRAÇÕES</p><h1>Credenciais de acesso</h1><p>Gerencie a coleta segura dos ambientes AWS, Azure e Google Cloud.</p></div><button class="primary-btn" id="new-credential-page">+ Adicionar credencial</button></div>
-      <div class="notice"><span>ⓘ</span><div><strong>Credenciais protegidas</strong><p>As credenciais são criptografadas no banco e utilizadas somente pelos conectores do provedor selecionado.</p></div></div>
-      <div class="table-panel"><div class="table-tools"><label class="search light"><span>⌕</span><input id="credential-search" placeholder="Buscar integração..."></label><span id="credential-count"></span></div><div class="table-wrap"><table><thead><tr><th>Integração</th><th>Provedor</th><th>Escopo</th><th>Última sincronização</th><th>Status</th><th></th></tr></thead><tbody id="credentials-body"></tbody></table></div></div>
+    <section id="credenciais" class="page ds" aria-labelledby="credenciais-title">
+      <div class="ds-head">
+        <div class="ds-head-copy">
+          <div class="ds-eyebrow">Integrações</div>
+          <h1 id="credenciais-title">Credenciais de acesso</h1>
+          <div class="ds-lead">Conecte contas GCP, AWS ou Azure com uma credencial JSON. A plataforma analisa o acesso e descobre os projetos, contas e assinaturas visíveis.</div>
+        </div>
+        <button type="button" class="btn btn-primary" id="new-credential-page"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg>Adicionar credencial</button>
+      </div>
+
+      <div class="ds-stats" id="credential-stats" aria-live="polite"></div>
+
+      <div class="ds-grid">
+        <section class="ds-cell ds-cell-main" aria-labelledby="credential-list-title">
+          <div class="ds-cell-head"><div class="card-kicker">Conectadas</div><div class="card-title" id="credential-list-title">Credenciais cadastradas</div></div>
+          <div class="ds-empty" id="credential-empty" hidden>
+            <div class="ds-empty-title">Nenhuma credencial cadastrada</div>
+            <div class="ds-empty-text">Adicione uma credencial para iniciar a análise de identidades e acessos.</div>
+            <button type="button" class="btn btn-primary" id="new-credential-empty">Adicionar credencial</button>
+          </div>
+          <div id="credential-list"></div>
+        </section>
+        <section class="ds-cell ds-cell-side" aria-labelledby="credential-requirements-title">
+          <div><div class="card-kicker">Requisitos</div><div class="card-title" id="credential-requirements-title">Permissões mínimas de leitura</div></div>
+          <div id="credential-requirements"></div>
+          <div class="ds-note">A plataforma só lê dados. As chaves são cifradas em repouso e nunca voltam a ser exibidas.</div>
+        </section>
+      </div>
     </section>
 
     <section id="auditoria" class="page">
@@ -137,15 +163,40 @@
     </form>
   </div>
 
-  <dialog id="credential-modal">
-    <form id="credential-form" method="dialog">
-      <div class="modal-header"><div><p class="eyebrow">INTEGRAÇÃO MULTI-CLOUD</p><h2 id="modal-title">Nova credencial</h2></div><button type="button" class="close-btn" id="close-modal">×</button></div>
-      <input type="hidden" id="credential-id">
-      <div class="form-grid"><label>Nome da integração<input id="credential-name" required placeholder="Nome da integração"></label><label>Provedor<select id="credential-provider" required><option>AWS</option><option>Azure</option><option>GCP</option></select></label></div>
-      <label>Credencial em JSON<textarea id="credential-json" required rows="9" spellcheck="false" placeholder='{"type": "service_account", ...}'></textarea><small>O JSON será validado conforme o provedor selecionado.</small></label>
-      <div id="json-feedback" class="json-feedback"></div>
-      <div class="modal-actions"><button type="button" class="secondary-btn" id="cancel-modal">Cancelar</button><button type="submit" class="primary-btn">Validar e conectar</button></div>
-    </form>
+  <dialog id="credential-modal" class="ds ds-dialog" aria-labelledby="credential-modal-title">
+    <div class="ds-dialog-head">
+      <div class="dialog-title" id="credential-modal-title">Nova credencial</div>
+      <button type="button" class="btn btn-icon" aria-label="Fechar" data-close-credential><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"></path></svg></button>
+    </div>
+    <div class="field">
+      <label id="credential-provider-label">Provedor</label>
+      <div class="seg" role="radiogroup" aria-labelledby="credential-provider-label">
+        <label class="seg-opt"><input type="radio" name="credential-provider" value="GCP" checked>GCP</label>
+        <label class="seg-opt"><input type="radio" name="credential-provider" value="AWS">AWS</label>
+        <label class="seg-opt"><input type="radio" name="credential-provider" value="Azure">Azure</label>
+      </div>
+    </div>
+    <div class="field"><label for="credential-name">Nome da integração</label><input class="input" id="credential-name" maxlength="100" autocomplete="off" placeholder="ex.: org-producao-leitura"></div>
+    <div class="field">
+      <div class="ds-field-row"><label for="credential-json">Credencial (JSON)</label><button type="button" class="btn btn-ghost ds-btn-xs" id="credential-sample">Inserir exemplo</button></div>
+      <textarea class="input ds-json" id="credential-json" spellcheck="false" autocomplete="off" aria-describedby="credential-json-hint"></textarea>
+      <div class="ds-hint" id="credential-json-hint"></div>
+    </div>
+    <div class="ds-alert" id="credential-error" role="alert" hidden></div>
+    <div class="ds-validated" id="credential-validated" hidden></div>
+    <div class="dialog-actions">
+      <button type="button" class="btn btn-secondary" data-close-credential>Cancelar</button>
+      <button type="button" class="btn btn-secondary" id="credential-validate">Validar credencial</button>
+      <button type="button" class="btn btn-primary" id="credential-save" disabled>Salvar integração</button>
+    </div>
+  </dialog>
+  <dialog id="credential-remove-modal" class="ds ds-dialog ds-dialog-sm" aria-labelledby="credential-remove-title">
+    <div class="dialog-title" id="credential-remove-title">Remover credencial?</div>
+    <div class="dialog-body" id="credential-remove-text"></div>
+    <div class="dialog-actions">
+      <button type="button" class="btn btn-secondary" data-close-remove>Cancelar</button>
+      <button type="button" class="btn btn-primary" id="credential-remove-confirm">Remover credencial</button>
+    </div>
   </dialog>
   <dialog id="user-modal">
     <form id="user-form" method="dialog">
@@ -170,6 +221,6 @@
     <div id="project-content"></div>
   </dialog>
   <div id="toast" role="status" aria-live="polite"></div>
-  <script src="app.js?v=20261007-drilldown"></script>
+  <script src="app.js?v=20261007-credentials"></script>
 </body>
 </html>
