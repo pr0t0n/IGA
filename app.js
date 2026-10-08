@@ -366,18 +366,21 @@ function renderAccesses() {
   const a = state.acc; const s = a.summary;
   $('#acc-unused-text').textContent = `Somente sem uso há mais de ${s.unusedDays} dias`;
   $('#acc-unused-label').hidden = a.view !== 'grants';
+  $('#acc-unused').disabled = !s.withUsage; if (!s.withUsage) { $('#acc-unused').checked = false; a.unused = false; }
+  $('#acc-unused-label').title = s.withUsage ? '' : 'Disponível quando o provedor fornecer dados de uso';
   setHTML('#acc-kpis', [
     stat('Concessões', fmt(s.total), `em ${fmt(state.credentials.length || new Set(a.grants.map(g => g.credentialId)).size)} ambiente(s)`),
     stat('Recursos', fmt(s.resources), 'projetos, contas, assinaturas e repositórios'),
-    stat(`Sem uso > ${s.unusedDays} dias`, fmt(s.unused), s.withUsage ? `${pct(s.unused, s.withUsage)}% das ${fmt(s.withUsage)} com telemetria de uso` : 'telemetria de uso não coletada', true),
+    s.withUsage ? stat(`Sem uso > ${s.unusedDays} dias`, fmt(s.unused), `${pct(s.unused, s.withUsage)}% das ${fmt(s.withUsage)} com telemetria de uso`, true) : stat(`Sem uso > ${s.unusedDays} dias`, '—', 'sem dados de uso dos provedores'),
     stat('Concessões diretas', fmt(s.direct), 'fora de grupos'),
     stat('Curingas (*)', fmt(s.wildcard), 'permissões irrestritas', true),
   ].join(''));
   const byProvider = s.byProvider.map(p => p.withUsage
     ? `<div class="stack-6"><div class="fw-row-top"><span class="semibold">${escapeHtml(p.provider)}</span><span class="strong">${pct(p.unused, p.withUsage)}%</span></div>${bar(pct(p.unused, p.withUsage), 'var(--color-accent)', 'bar-8')}<div class="muted-sm">${fmt(p.unused)} de ${fmt(p.withUsage)} concessões com telemetria${p.granted ? ` · ${pct(p.used, p.granted)}% das permissões exercidas` : ''}</div>${p.usageHint ? `<div class="note">${escapeHtml(p.usageLabel)}. ${escapeHtml(p.usageHint)}</div>` : ''}</div>`
-    : `<div class="stack-6"><div class="fw-row-top"><span class="semibold">${escapeHtml(p.provider)}</span><span class="tag tag-outline">${p.usageStatus === 'not_collected' ? 'Não coletado' : 'Sem telemetria'}</span></div><div class="muted-sm">${fmt(p.total)} concessões sem dados de uso. ${escapeHtml(p.usageLabel)}.</div>${p.usageHint ? `<div class="flag">${escapeHtml(p.usageHint)}</div>` : ''}${p.usageStatus === 'not_collected' && !isReadonly() ? '<button type="button" class="btn btn-secondary btn-sm" data-nav="credenciais">Reanalisar em Credenciais</button>' : ''}</div>`).join('') || '<div class="empty">Nenhuma concessão coletada.</div>';
+    : `<div class="stack-6"><div class="fw-row-top"><span class="semibold">${escapeHtml(p.provider)}</span><span class="strong">—</span></div>${bar(0, '', 'bar-8')}<div class="muted-sm">Sem dados de uso para ${fmt(p.total)} concessões.</div></div>`).join('') || '<div class="empty">Nenhuma concessão coletada.</div>';
+  const missingUsage = s.byProvider.some(p => !p.withUsage);
   setHTML('#acc-side', `
-    <div class="stack-12"><div><div class="card-kicker">Uso real</div><div class="card-title">Concessões sem uso (${s.unusedDays} dias)</div></div>${byProvider}</div>
+    <div class="stack-12"><div><div class="card-kicker">Uso real</div><div class="card-title">Concessões sem uso (${s.unusedDays} dias)</div></div>${byProvider}${missingUsage ? '<button type="button" class="btn btn-ghost btn-xs" data-nav="credenciais">Ver coleta na integração →</button>' : ''}</div>
     <div class="stack-10 divider-top"><div class="card-title">Origem das concessões</div><div class="split-bar">${s.total ? `<span class="ink" data-w="${pct(s.direct, s.total)}%"></span><span class="gray" data-w="${100 - pct(s.direct, s.total)}%"></span>` : '<span class="gray" data-w="100%"></span>'}</div><div class="split-legend"><span><b>${fmt(s.direct)}</b> diretas (${pct(s.direct, s.total)}%)</span><span><b>${fmt(s.group)}</b> via grupo (${pct(s.group, s.total)}%)</span></div><div class="note">Concessões diretas a pessoas dificultam a revisão. Prefira grupos e papéis.</div></div>
     <button type="button" class="btn btn-primary btn-block" data-go-rule="PERMISSION_USAGE">Ver achados de uso real</button>`);
   const providerOk = provider => a.prov === 'all' || provider === a.prov;
@@ -543,13 +546,19 @@ function credentialStatus(c) {
   if (c.status === 'Conectado') return { label: 'Ativa', tag: 'tag-neutral', attention: false };
   return { label: 'Aguardando análise', tag: 'tag-outline', attention: false };
 }
+function collectionNote(c) {
+  const notes = [];
+  if (c.usageStatus && c.usageStatus !== 'collected') notes.push(`<b>Uso de permissões ${c.usageStatus === 'partial' ? 'parcial' : 'não coletado'}.</b> ${escapeHtml(c.collectionHint)}`);
+  if (c.provider === 'GCP' && ['permission_denied', 'partial', 'unavailable'].includes(c.telemetryStatus)) notes.push(`<b>Logs de auditoria ${c.telemetryStatus === 'partial' ? 'parciais' : 'não coletados'}.</b> Conceda roles/logging.viewer nos projetos analisados.`);
+  return notes.length ? `<div class="cred-note">${notes.join('<br>')}</div>` : '';
+}
 function credentialRow(c) {
   const status = credentialStatus(c); const scanning = credentialUi.scanning.has(c.id); const lock = scanning ? ' disabled' : '';
   const shown = c.scopes.slice(0, MAX_SCOPE_TAGS); const remaining = c.scopes.length - shown.length;
   const scopes = shown.map(s => `<span class="tag tag-neutral" title="${escapeHtml(s.name)}">${escapeHtml(s.label)}</span>`).join('') + (remaining > 0 ? `<span class="tag tag-neutral">+${remaining}</span>` : '');
   const scopeText = c.scopes.length ? `${c.scopes.length} ${(SCOPE_KIND[c.provider] || 'escopo').toLowerCase()}(s)` : 'escopos descobertos na primeira análise';
   const actions = isReadonly() ? '<span class="muted-sm">Somente leitura</span>' : `<button type="button" class="btn btn-secondary" data-credential-action="scan" data-id="${c.id}"${lock}>${scanning ? 'Analisando…' : c.lastSyncedAt ? 'Reanalisar' : 'Analisar'}</button><button type="button" class="btn btn-secondary" data-credential-action="edit" data-id="${c.id}"${lock}>Editar</button><button type="button" class="btn btn-ghost" data-credential-action="remove" data-id="${c.id}"${lock}>Remover</button>`;
-  return `<article class="cred"><div class="cred-prov">${escapeHtml(c.provider)}</div><div class="cred-body"><div class="cred-title"><span class="cred-name">${escapeHtml(c.name)}</span><span class="tag ${status.tag}">${escapeHtml(status.label)}</span></div><div class="cred-ident" title="${escapeHtml(c.principal)}">${escapeHtml(c.kind)}${c.principal ? ` · ${escapeHtml(c.principal)}` : ''}</div>${scopes ? `<div class="cred-scopes">${scopes}</div>` : ''}${c.status === 'Erro' && c.lastError ? `<div class="cred-error">${escapeHtml(c.lastError)}</div>` : ''}<div class="muted-sm">Última análise: ${formatDate(c.lastSyncedAt)} · ${escapeHtml(scopeText)}</div></div><div class="cred-actions">${actions}</div></article>`;
+  return `<article class="cred"><div class="cred-prov">${escapeHtml(c.provider)}</div><div class="cred-body"><div class="cred-title"><span class="cred-name">${escapeHtml(c.name)}</span><span class="tag ${status.tag}">${escapeHtml(status.label)}</span></div><div class="cred-ident" title="${escapeHtml(c.principal)}">${escapeHtml(c.kind)}${c.principal ? ` · ${escapeHtml(c.principal)}` : ''}</div>${scopes ? `<div class="cred-scopes">${scopes}</div>` : ''}${c.status === 'Erro' && c.lastError ? `<div class="cred-error">${escapeHtml(c.lastError)}</div>` : ''}${collectionNote(c)}<div class="muted-sm">Última análise: ${formatDate(c.lastSyncedAt)} · ${escapeHtml(scopeText)}</div></div><div class="cred-actions">${actions}</div></article>`;
 }
 function renderCredentials() {
   const creds = state.credentials; const providers = ['GCP', 'AWS', 'Azure'].filter(p => creds.some(c => c.provider === p));

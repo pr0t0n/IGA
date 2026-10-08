@@ -450,6 +450,9 @@ pre.json { margin: 0; padding: 14px; background: var(--color-text); color: var(-
 .cred-ident { font-size: 12px; color: var(--color-neutral-700); font-family: var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cred-scopes { display: flex; gap: 4px; flex-wrap: wrap; }
 .cred-error { font-size: 13px; color: var(--color-accent-700); font-weight: 600; overflow-wrap: anywhere; }
+.cred-note { font-size: 12px; color: var(--color-neutral-700); border-left: 2px solid var(--color-accent-300); padding-left: 8px; overflow-wrap: anywhere; }
+.cred-note b { color: var(--color-text); font-weight: 600; }
+.check:has(input:disabled) { opacity: 0.45; cursor: not-allowed; }
 .cred-actions { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
 .cred-empty { padding: 32px 0; border-top: 1px solid var(--color-divider); display: flex; flex-direction: column; gap: 10px; align-items: flex-start; }
 .cred-empty b { font-weight: 800; font-size: 17px; }

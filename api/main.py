@@ -623,10 +623,28 @@ def decrypt_credential(row: Any) -> dict[str, Any]:
         raise HTTPException(500, "Não foi possível descriptografar a credencial") from exc
 
 
-def credential_view(row: Any, discovered_scopes: list[dict[str, str]] | None = None) -> dict[str, Any]:
+def latest_collection(connection: DatabaseConnection, credential_id: int | None = None) -> dict[int, Any]:
+    clause, params = (" AND credential_id=?", (credential_id,)) if credential_id is not None else ("", ())
+    rows = connection.execute(
+        f"""SELECT credential_id,usage_status,telemetry_status FROM scans WHERE id IN (
+            SELECT MAX(id) FROM scans WHERE status='completed'{clause} GROUP BY credential_id)""", params).fetchall()
+    return {row["credential_id"]: row for row in rows}
+
+
+def collection_view(provider: str, scan: Any | None) -> dict[str, Any]:
+    """What the last analysis could collect beyond IAM: permission usage and behavioral audit logs."""
+    if scan is None:
+        return {"usageStatus": None, "telemetryStatus": None, "collectionHint": ""}
+    usage = scan["usage_status"] or "not_collected"
+    hint = "" if usage == "collected" else USAGE_HINT.get(provider, "")
+    return {"usageStatus": usage, "telemetryStatus": scan["telemetry_status"], "collectionHint": hint}
+
+
+def credential_view(row: Any, discovered_scopes: list[dict[str, str]] | None = None, scan: Any | None = None) -> dict[str, Any]:
     """Public view: secrets are never returned once stored."""
     selected = json.loads(row["scopes_json"]) if row["scopes_json"] else None
     return {
+        **collection_view(row["provider"], scan),
         "id": row["id"], "name": row["name"], "provider": row["provider"],
         "kind": row["auth_kind"] or REQUIREMENTS[row["provider"]]["kind"],
         "principal": row["principal"] or "",
@@ -658,7 +676,8 @@ def single_credential_view(connection: DatabaseConnection, credential_id: int) -
     row = connection.execute("SELECT * FROM credentials WHERE id=?", (credential_id,)).fetchone()
     if not row:
         raise HTTPException(404, "Credencial não encontrada")
-    return credential_view(row, discovered_scopes(connection, credential_id).get(credential_id))
+    return credential_view(row, discovered_scopes(connection, credential_id).get(credential_id),
+                           latest_collection(connection, credential_id).get(credential_id))
 
 
 def audit_record_hash(previous: str | None, record: dict[str, Any]) -> str:
@@ -894,7 +913,8 @@ def list_credentials() -> list[dict[str, Any]]:
     with db() as connection:
         rows = connection.execute("SELECT * FROM credentials ORDER BY updated_at DESC").fetchall()
         scopes = discovered_scopes(connection)
-    return [credential_view(row, scopes.get(row["id"])) for row in rows]
+        scans = latest_collection(connection)
+    return [credential_view(row, scopes.get(row["id"]), scans.get(row["id"])) for row in rows]
 
 
 @app.get("/api/credentials/requirements")
