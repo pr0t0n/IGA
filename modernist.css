@@ -418,6 +418,11 @@ dialog.dialog::backdrop { background: color-mix(in srgb, var(--color-neutral-900
 .exp-obs .val { font-size: 14px; }
 .exp-obs .val.obs { font-weight: 600; }
 .dev-big { display: flex; align-items: flex-end; gap: 8px; }
+.explain-block { display: flex; flex-direction: column; gap: 4px; }
+.explain-block p { margin: 0; font-size: 14px; text-wrap: pretty; overflow-wrap: anywhere; }
+.explain-block.summary { border-left: 2px solid var(--color-accent); padding-left: 10px; }
+.explain-block.summary p { font-size: 15px; font-weight: 600; }
+ol.actions { margin: 0; padding-left: 20px; font-size: 14px; display: flex; flex-direction: column; gap: 6px; overflow-wrap: anywhere; }
 .dev-big b { font-family: var(--font-heading); font-weight: 800; font-size: 48px; line-height: 0.9; }
 .dev-big span { font-size: 13px; color: var(--color-neutral-700); padding-bottom: 4px; }
 

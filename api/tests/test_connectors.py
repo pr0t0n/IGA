@@ -222,5 +222,21 @@ class ConnectorNormalizationTest(unittest.TestCase):
         self.assertEqual(connectors.gcp_usage(object(), ["p"])["status"], "permission_denied")
 
 
+    def test_anomaly_explanation_for_denied_automation_loop(self):
+        import catalog
+        events = [{"timestamp": f"2026-10-08T01:{minute:02d}:07Z", "method": "v1.compute.targetHttpsProxies.insert",
+                   "denied": True, "callerIp": "34.60.235.158"} for minute in range(10, 60)]
+        result = catalog.explain_anomaly(events, "crossplane-gcp-provider-sa@shared.iam.gserviceaccount.com", "GCP", "demo-project")
+        self.assertEqual(result["category"], "Tentativa negada pelo provedor")
+        self.assertEqual(result["title"], "Tentativas negadas de criar Target HTTPS Proxy em demo-project")
+        self.assertIn("50 vezes", result["happened"])
+        self.assertIn("recusou todas", result["happened"])
+        self.assertIn("1 por minuto", result["interpretation"])
+        self.assertIn("Crossplane", result["interpretation"])
+        self.assertEqual(result["permission"], "compute.targetHttpsProxies.create")
+        self.assertTrue(any("compute.targetHttpsProxies.create" in action for action in result["actions"]))
+        self.assertEqual(catalog.humanize_method("google.iam.admin.v1.CreateServiceAccountKey")["object"], "chave de service account")
+
+
 if __name__ == "__main__":
     unittest.main()

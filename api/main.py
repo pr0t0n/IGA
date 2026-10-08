@@ -20,7 +20,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 from catalog import (DEFAULT_SETTINGS, FRAMEWORKS, MODULES, RULE_DETAILS, RULE_PARAMETERS, SCHEDULES, SEVERITY_ORDER,
-                     classify_event, framework_report, identity_risk, merged_settings, risk_level, risk_score)
+                     classify_event, explain_anomaly, framework_report, humanize_method, identity_risk, merged_settings,
+                     risk_level, risk_score)
 from connectors import REQUIREMENTS, USAGE_HINT, ConnectorError, aws_expiry, describe_credential, discover, normalize_credential, probe, scope_entry
 
 DB_PATH = os.getenv("DATABASE_PATH", "/data/iga.db")
@@ -428,7 +429,7 @@ def init_db() -> None:
         ensure_columns(connection, "audit_events", {column: "TEXT" for column in (
             "action", "target", "result", "source", "details_json", "record_hash")})
         ensure_columns(connection, "platform_users", {"last_login_at": "TEXT"})
-        ensure_columns(connection, "findings", {"updated_at": "TEXT"})
+        ensure_columns(connection, "findings", {"updated_at": "TEXT", "evidence_json": "TEXT"})
         ensure_columns(connection, "access_grants", {"used_permissions": "INTEGER", "total_permissions": "INTEGER"})
         ensure_columns(connection, "scans", {"usage_status": "TEXT"})
         if connection.postgres:
@@ -743,9 +744,9 @@ def days_since(value: Any) -> int | None:
 
 
 def finding(rule: str, severity: str, title: str, description: str,
-            identity_id: str | None = None, resource_id: str | None = None) -> dict[str, Any]:
+            identity_id: str | None = None, resource_id: str | None = None, evidence: dict[str, Any] | None = None) -> dict[str, Any]:
     return {"rule": rule, "severity": severity, "title": title, "description": description,
-            "identityId": identity_id, "resourceId": resource_id}
+            "identityId": identity_id, "resourceId": resource_id, "evidence": evidence}
 
 
 def calculate_risk_score(findings: list[dict[str, Any]], assessed_objects: int = 1) -> int:
@@ -784,7 +785,7 @@ def hours_since(value: Any) -> float | None:
 
 
 def evaluate_rules(identities: list[dict[str, Any]], accesses: list[dict[str, Any]],
-                   events: list[dict[str, Any]], rules: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+                   events: list[dict[str, Any]], rules: dict[str, Any] | None = None, provider: str = "") -> list[dict[str, Any]]:
     limits = {**DEFAULT_SETTINGS["rules"], **(rules or {})}
     results: list[dict[str, Any]] = []
     identities_by_id = {str(item.get("id")): item for item in identities}
@@ -867,22 +868,20 @@ def evaluate_rules(identities: list[dict[str, Any]], accesses: list[dict[str, An
                 "A política IAM concede acesso a allUsers ou allAuthenticatedUsers.", identity_id,
                 str(grants[0].get("resourceId", "")) if grants else None))
 
-    anomaly_groups: dict[tuple[str, str, str], dict[str, Any]] = {}
+    # One anomaly per identity × resource × operation × outcome, explained in plain language.
+    anomaly_groups: dict[tuple[str, str, str, bool], list[dict[str, Any]]] = {}
     for event in events:
         score = float(event.get("riskScore", 0))
         if score * 100 < limits["ueba_threshold"]:
             continue
-        identity_id = str(event.get("identityId", ""))
-        resource_id = str(event.get("resourceId", ""))
-        description = str(event.get("description", "Evento fora do padrão comportamental."))
-        key = (identity_id, resource_id, description)
-        group = anomaly_groups.setdefault(key, {"count": 0, "score": 0.0})
-        group["count"] += 1
-        group["score"] = max(group["score"], score)
-    for (identity_id, resource_id, description), group in anomaly_groups.items():
-        evidence = f"{group['count']} ocorrência(s) nos últimos 7 dias. {description}"
-        results.append(finding("UEBA_ANOMALY", "critical" if group["score"] >= 0.9 else "high",
-            "Comportamento de acesso anômalo", evidence, identity_id, resource_id))
+        key = (str(event.get("identityId", "")), str(event.get("resourceId", "")), str(event.get("method") or ""), bool(event.get("denied")))
+        anomaly_groups.setdefault(key, []).append(event)
+    for (identity_id, resource_id, method, denied), group in anomaly_groups.items():
+        score = max(float(item.get("riskScore", 0)) for item in group)
+        explanation = explain_anomaly(group, identity_id, provider, resource_id)
+        results.append(finding("UEBA_ANOMALY", "critical" if score >= 0.9 else "high", explanation["title"],
+            explanation["happened"], identity_id, resource_id,
+            {"method": method, "denied": denied, "count": len(group), "score": score, "category": explanation["category"]}))
     return results
 
 
@@ -1061,8 +1060,11 @@ def audit_trail(limit: int = Query(1000, ge=1, le=5000)) -> dict[str, Any]:
                    "riskScore": row["risk_score"], "description": row["description"]}
         record = {"timestamp": row["occurred_at"], "actor": row["identity_external_id"], "action": row["method"],
                   "target": row["resource_id"], "source": row["source"], "details": details}
-        events.append({"key": f"T-{row['id']}", "id": row["id"], "type": "provider", "title": row["method"] or "Evento do provedor",
-                       "text": row["description"] or "", "actor": row["identity_external_id"] or "—", "createdAt": row["occurred_at"],
+        action = humanize_method(row["method"])
+        human = (f"Tentativa negada de {action['verb']} {action['object']}" if row["denied"] else f"{action['verb'].capitalize()} {action['object']}") + (
+            f" em {row['resource_id']}" if row["resource_id"] else "")
+        events.append({"key": f"T-{row['id']}", "id": row["id"], "type": "provider", "title": human,
+                       "text": human + (" (recusada pelo provedor)" if row["denied"] else ""), "actor": row["identity_external_id"] or "—", "createdAt": row["occurred_at"],
                        "action": row["method"] or "—", "target": row["resource_id"] or "", "result": "Falha" if row["denied"] else "Sucesso",
                        "source": row["source"], "details": details,
                        "hash": hashlib.sha256(json.dumps(record, sort_keys=True, ensure_ascii=False).encode()).hexdigest()})
@@ -1216,7 +1218,7 @@ def execute_scan(credential_id: int, actor: str) -> dict[str, Any]:
                 item["lastReviewedAt"] = decided
         telemetry_status = discovered.get("telemetryStatus", "collected" if events else "not_collected")
         projects = discovered.get("projects", [])
-        findings = evaluate_rules(identities, accesses, events, settings["rules"])
+        findings = evaluate_rules(identities, accesses, events, settings["rules"], row["provider"])
         risk_score_value = calculate_risk_score(findings, len(identities) + len(accesses))
         cursor = connection.execute(
             "INSERT INTO scans(credential_id,provider,status,started_at) VALUES(?,?,?,?) RETURNING id",
@@ -1278,9 +1280,10 @@ def execute_scan(credential_id: int, actor: str) -> dict[str, Any]:
                 new_critical.append(item)
             connection.execute(
                 """INSERT INTO findings(credential_id,scan_id,rule_code,severity,title,description,
-                   identity_external_id,resource_id,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                   identity_external_id,resource_id,status,evidence_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (credential_id, scan_id, item["rule"], item["severity"], item["title"], item["description"],
-                 item["identityId"], item["resourceId"], carried.get(key, "open"), now, now),
+                 item["identityId"], item["resourceId"], carried.get(key, "open"),
+                 json.dumps(item["evidence"], ensure_ascii=False) if item.get("evidence") else None, now, now),
             )
         finished_at = utc_now()
         connection.execute(
@@ -1312,6 +1315,7 @@ def execute_scan(credential_id: int, actor: str) -> dict[str, Any]:
     ai_analysis = generate_platform_analysis(
         credential_id, scan_id, row["name"], row["provider"], identities, accesses, findings, projects
     )
+    pregenerate_ueba_explanations(credential_id)
     return {"scanId": scan_id, "status": "completed", "provider": row["provider"], "source": "live",
             "identities": len(identities), "accesses": len(accesses), "findings": len(findings),
             "riskScore": risk_score_value, "finishedAt": finished_at,
@@ -1546,18 +1550,13 @@ def dashboard_overview(credential_id: int | None, provider: str | None, period: 
         anomalies_24h = connection.execute(
             f"SELECT COUNT(*) count FROM telemetry_events WHERE anomalous=1 AND occurred_at>=? AND credential_id IN ({marks})",
             ((now - timedelta(hours=24)).isoformat(), *params)).fetchone()["count"]
-        recent_events = connection.execute(
-            f"""SELECT t.*,c.provider FROM telemetry_events t JOIN credentials c ON c.id=t.credential_id
-                WHERE t.anomalous=1 AND t.credential_id IN ({marks}) ORDER BY t.occurred_at DESC LIMIT 5""", params
-        ).fetchall()
         top = sorted(open_scoped, key=lambda row: (SEVERITY_ORDER.get(row["severity"], 9), row["id"]))[:5]
         priorities = [{"id": row["id"], "severity": row["severity"], "rule": RULE_CATALOG.get(row["rule_code"], {}).get("name", row["rule_code"]),
                        "title": row["title"], "who": identity_label(connection, row["credential_id"], row["identity_external_id"]),
                        "where": f"{row['provider']} {resource_label(connection, row['credential_id'], row['resource_id'])}".strip(),
                        "firstSeen": first_seen(connection, row)} for row in top]
-        recent = [{"time": row["occurred_at"], "title": row["description"] or row["method"], "who": row["identity_external_id"],
-                   "provider": row["provider"], "category": classify_event(row["method"], bool(row["denied"]), row["occurred_at"])}
-                  for row in recent_events]
+        recent = [{"time": item["occurredAt"], "title": item["title"], "who": item["who"], "provider": item["provider"],
+                   "category": item["category"]} for item in [entry for entry in ueba_items(connection, None) if entry["credentialId"] in ids][:5]]
         metrics = compliance_metrics(connection, ids)
         orphan = sum(1 for row in open_scoped if row["rule_code"] == "ORPHAN_ACCOUNT")
     severities = {level: sum(1 for row in open_scoped if row["severity"] == level) for level in ("critical", "high", "medium", "low")}
@@ -2338,6 +2337,181 @@ def list_ai_analyses(credential_id: int | None = None, limit: int = Query(100, g
             for row in rows]
 
 
+def event_dict(row: Any) -> dict[str, Any]:
+    return {"timestamp": row["occurred_at"], "method": row["method"], "denied": bool(row["denied"]), "callerIp": row["caller_ip"],
+            "resourceId": row["resource_id"], "riskScore": row["risk_score"], "anomalous": bool(row["anomalous"])}
+
+
+def anomaly_events(identity_events: list[Any], finding_row: Any) -> list[Any]:
+    evidence = json.loads(finding_row["evidence_json"]) if finding_row["evidence_json"] else None
+    same_resource = [item for item in identity_events if item["anomalous"] and (item["resource_id"] or "") == (finding_row["resource_id"] or "")]
+    if evidence:
+        return [item for item in same_resource if (item["method"] or "") == evidence.get("method", "") and bool(item["denied"]) == bool(evidence.get("denied"))]
+    return [item for item in same_resource if item["description"] and item["description"] in finding_row["description"]]
+
+
+def cached_ueba_explanation(connection: DatabaseConnection, finding_row: Any) -> dict[str, Any] | None:
+    cached = connection.execute(
+        "SELECT * FROM ai_analyses WHERE scope_type='ueba' AND scope_id=? AND scan_id=?",
+        (str(finding_row["id"]), finding_row["scan_id"])).fetchone()
+    if not cached:
+        return None
+    return {"engine": cached["engine"], "summary": cached["summary"], "createdAt": cached["created_at"]}
+
+
+def ueba_items(connection: DatabaseConnection, credential_id: int | None, statuses: tuple[str, ...] = ("open", "incident"),
+               finding_id: int | None = None) -> list[dict[str, Any]]:
+    """UEBA anomalies with their evidence, rule-based explanation and, when generated, the local LLM explanation."""
+    clause, params = (" AND credential_id=?", (credential_id,)) if credential_id is not None else ("", ())
+    extra, extra_params = (" AND f.id=?", (finding_id,)) if finding_id is not None else ("", ())
+    findings = connection.execute(
+        f"""SELECT f.*,c.provider FROM findings f JOIN credentials c ON c.id=f.credential_id
+            WHERE f.rule_code='UEBA_ANOMALY' AND f.status IN ({placeholders(list(statuses))}){clause.replace('credential_id', 'f.credential_id')}{extra}
+            ORDER BY f.id DESC LIMIT 500""", (*statuses, *params, *extra_params)).fetchall()
+    if not findings:
+        return []
+    events = connection.execute(f"SELECT * FROM telemetry_events WHERE 1=1{clause} ORDER BY occurred_at DESC LIMIT 20000", params).fetchall()
+    privileged = {(row["credential_id"], row["identity_external_id"]) for row in connection.execute(
+        f"SELECT DISTINCT credential_id,identity_external_id FROM access_grants WHERE privileged=1{clause}", params).fetchall()}
+    labels = {(row["credential_id"], row["external_id"]): row["display_name"] for row in connection.execute(
+        f"SELECT credential_id,external_id,display_name FROM identities WHERE 1=1{clause}", params).fetchall()}
+    by_identity: dict[tuple[int, str], list[Any]] = {}
+    for row in events:
+        by_identity.setdefault((row["credential_id"], row["identity_external_id"]), []).append(row)
+    items = []
+    for row in findings:
+        identity_events = by_identity.get((row["credential_id"], row["identity_external_id"] or ""), [])
+        matched = anomaly_events(identity_events, row)
+        baseline = sum(1 for item in identity_events if not item["anomalous"])
+        resource = row["resource_id"] or ""
+        explanation = explain_anomaly([event_dict(item) for item in matched], row["identity_external_id"] or "", row["provider"],
+                                      resource, baseline) if matched else None
+        deviation = round(max((item["risk_score"] for item in matched), default=0.9 if row["severity"] == "critical" else 0.8) * 100)
+        base = explanation or {"title": row["title"], "category": "Operação sensível", "happened": row["description"],
+                               "why": "", "interpretation": "", "actions": [], "expected": "", "observed": row["description"],
+                               "permission": "", "lastAt": row["created_at"], "count": 0}
+        ai = cached_ueba_explanation(connection, row)
+        items.append({"id": row["id"], "scanId": row["scan_id"], "credentialId": row["credential_id"], "occurredAt": base["lastAt"],
+                      "identityId": row["identity_external_id"],
+                      "who": labels.get((row["credential_id"], row["identity_external_id"]), row["identity_external_id"]),
+                      "provider": row["provider"], "category": base["category"], "title": base["title"], "severity": row["severity"],
+                      "summary": ai["summary"] if ai else "", "engine": ai["engine"] if ai else "regras",
+                      "happened": base["happened"], "why": base["why"], "interpretation": base["interpretation"], "actions": base["actions"],
+                      "rules": base, "expected": base["expected"], "observed": base["observed"], "permission": base["permission"],
+                      "deviation": deviation, "confidence": "alta confiança" if deviation >= 80 else "média confiança",
+                      "status": row["status"], "privileged": (row["credential_id"], row["identity_external_id"]) in privileged})
+    return sorted(items, key=lambda item: item["occurredAt"] or "", reverse=True)
+
+
+FACT_PATTERNS = (re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"), re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b"),
+                 re.compile(r"\b[a-z]+\.[a-zA-Z]+\.[a-z]+\b"), re.compile(r"\b\d+\b"))
+LLM_LOCK = threading.Lock()
+
+
+CLAIM_TERMS = ("por segundo", "por minuto", "por hora", "normal", "esperad", "seguro", "sem risco", "não há risco", "ataque",
+               "malicios", "mal-intencion", "mal intencion", "invasor", "vazamento", "comprometid", "fraude", "hacker", "comum", "rotineir", "legítim")
+DENIED_CONTRADICTIONS = ("foi concluída", "foi realizada", "com sucesso", "está disponível", "possui a permissão", "tem a permissão",
+                         "tem permissão", "foi permitid", "foi aprovad")
+ALLOWED_CONTRADICTIONS = ("recusad", "negad", "bloquead", "não foi realizada", "não foi concluída", "falhou")
+
+
+def grounded(text: str, facts_text: str) -> bool:
+    """Reject LLM text with e-mails, IPs, permissions, numbers or claims (rate, normality, attack) absent from the facts."""
+    lowered, facts_lower = text.lower(), facts_text.lower()
+    return (all(token in facts_text for pattern in FACT_PATTERNS for token in pattern.findall(text))
+            and all(term in facts_lower for term in CLAIM_TERMS if term in lowered))
+
+
+def anomaly_facts(item: dict[str, Any]) -> dict[str, Any]:
+    rules = item["rules"]
+    return {"quem": item["identityId"], "tipo_de_conta": "service account (conta de máquina)" if "gserviceaccount" in (item["identityId"] or "") else "usuário (pessoa)",
+            "fato_principal": rules["happened"], "operacao": rules["title"], "categoria": rules["category"], "quantidade": rules["count"],
+            "resultado": "o provedor RECUSOU a operação (não foi realizada)" if rules["denied"] else "a operação FOI REALIZADA com sucesso",
+            "ritmo_e_horario": rules["observed"],
+            "interpretacao_das_regras": rules["interpretation"], "permissao_provavel": rules["permission"] or None,
+            "primeira_acao_recomendada": rules["actions"][0] if rules["actions"] else None}
+
+
+def consistent(summary: str, denied: bool) -> bool:
+    """The summary must agree with the outcome: denied operations were not completed, allowed ones were not refused."""
+    text = summary.lower().replace("não tem permissão", "").replace("não possui a permissão", "").replace("sem permissão", "")
+    return not any(term in text for term in (DENIED_CONTRADICTIONS if denied else ALLOWED_CONTRADICTIONS))
+
+
+def llm_explain_anomaly(item: dict[str, Any]) -> tuple[str, str]:
+    """Ask the local LLM for a short manager-level summary built only from the rule facts; '' when it cannot be trusted."""
+    facts = anomaly_facts(item)
+    facts_text = json.dumps(facts, ensure_ascii=False) + json.dumps(item["rules"], ensure_ascii=False)
+    prompt = ("Explique para um gestor de segurança, em português do Brasil, em no máximo 3 frases curtas e sem repetir o nome técnico "
+              "da operação: quem fez o quê (baseado em fato_principal), o que isso provavelmente significa (baseado em interpretacao_das_regras) "
+              "e qual a primeira coisa a fazer (primeira_acao_recomendada). Use somente estes fatos, sem acrescentar números, ritmos, "
+              "causas ou julgamentos que não estejam neles. Responda em JSON com a chave resumo contendo UM ÚNICO texto corrido. "
+              f"Fatos: {json.dumps(facts, ensure_ascii=False)}")
+    for temperature in (0.2, 0.0):
+        try:
+            with LLM_LOCK:
+                response = requests.post(f"{OLLAMA_URL}/api/chat", json={
+                    "model": QWEN_MODEL, "stream": False, "think": False, "format": "json",
+                    "messages": [{"role": "system", "content": "Você é um analista de segurança de identidades. Escreva de forma clara para quem não é técnico e nunca extrapole os fatos."},
+                                 {"role": "user", "content": prompt}],
+                    "options": {"temperature": temperature, "num_predict": 300},
+                }, timeout=180)
+            response.raise_for_status()
+            summary = json.loads(response.json()["message"]["content"]).get("resumo")
+            if isinstance(summary, dict):
+                summary = " ".join(str(value).strip().rstrip(".") + "." for value in summary.values() if isinstance(value, str) and value.strip())
+            elif isinstance(summary, list):
+                summary = " ".join(str(value).strip() for value in summary if isinstance(value, str))
+        except (requests.RequestException, ValueError, KeyError, TypeError, AttributeError):
+            return "regras", ""
+        if (isinstance(summary, str) and 40 <= len(summary) <= 700 and grounded(summary, facts_text)
+                and consistent(summary, bool(item["rules"]["denied"]))):
+            return f"{QWEN_MODEL}+guardrails", summary.strip()
+    return "regras", ""
+
+
+def explain_ueba_finding(finding_id: int, force: bool = False) -> dict[str, Any]:
+    with db() as connection:
+        found = ueba_items(connection, None, ("open", "incident", "accepted", "dismissed", "remediating"), finding_id)
+    if not found:
+        raise HTTPException(404, "Anomalia não encontrada")
+    item = found[0]
+    if item["summary"] and not force:
+        return {"cached": True, **item}
+    engine, summary = llm_explain_anomaly(item)
+    if summary:
+        with db() as connection:
+            connection.execute("DELETE FROM ai_analyses WHERE scope_type='ueba' AND scope_id=? AND scan_id=?", (str(finding_id), item["scanId"]))
+            connection.execute(
+                """INSERT INTO ai_analyses(credential_id,scan_id,scope_type,scope_id,engine,summary,why,recommendation,treatment,priority,
+                   context_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (item["credentialId"], item["scanId"], "ueba", str(finding_id), engine, summary, "", "", "[]", item["severity"],
+                 json.dumps(anomaly_facts(item), ensure_ascii=False), utc_now()))
+    return {"cached": False, **item, "summary": summary, "engine": engine}
+
+
+def pregenerate_ueba_explanations(credential_id: int) -> None:
+    """Generate LLM explanations in the background right after a scan so the UEBA detail opens instantly."""
+    if os.getenv("AI_PREGENERATE", "1") == "0":
+        return
+
+    def work() -> None:
+        with db() as connection:
+            ids = [item["id"] for item in ueba_items(connection, credential_id) if not item["summary"]]
+        for finding_id in ids:
+            try:
+                explain_ueba_finding(finding_id)
+            except Exception as exc:  # one failure must not stop the remaining explanations
+                print(f"ueba explanation {finding_id}: {type(exc).__name__}", flush=True)
+
+    threading.Thread(target=work, name=f"ueba-llm-{credential_id}", daemon=True).start()
+
+
+@app.post("/api/ueba/{finding_id}/explanation")
+def ueba_explanation(finding_id: int, force: bool = False) -> dict[str, Any]:
+    return explain_ueba_finding(finding_id, force)
+
+
 @app.get("/api/ueba/overview")
 def ueba_overview(credential_id: int | None = None) -> dict[str, Any]:
     clause, params = (" AND credential_id=?", (credential_id,)) if credential_id is not None else ("", ())
@@ -2347,46 +2521,14 @@ def ueba_overview(credential_id: int | None = None) -> dict[str, Any]:
         threshold = load_settings(connection)["rules"]["ueba_threshold"]
         recent = connection.execute(
             f"SELECT occurred_at,anomalous FROM telemetry_events WHERE occurred_at>=?{clause}", (day_ago.isoformat(), *params)).fetchall()
-        findings = connection.execute(
-            f"""SELECT f.*,c.provider FROM findings f JOIN credentials c ON c.id=f.credential_id
-                WHERE f.rule_code='UEBA_ANOMALY' AND f.status IN ('open','incident'){clause.replace('credential_id', 'f.credential_id')}
-                ORDER BY f.id DESC LIMIT 500""", params).fetchall()
-        events = connection.execute(
-            f"SELECT * FROM telemetry_events WHERE 1=1{clause} ORDER BY occurred_at DESC LIMIT 20000", params).fetchall()
-        privileged = {(row["credential_id"], row["identity_external_id"]) for row in connection.execute(
-            f"SELECT DISTINCT credential_id,identity_external_id FROM access_grants WHERE privileged=1{clause}", params).fetchall()}
-        coverage = ueba_status(credential_id)
-        labels = {(row["credential_id"], row["external_id"]): row["display_name"] for row in connection.execute(
-            f"SELECT credential_id,external_id,display_name FROM identities WHERE 1=1{clause}", params).fetchall()}
+        anomalies = ueba_items(connection, credential_id)
+    coverage = ueba_status(credential_id)
     hours = []
     for offset in range(23, -1, -1):
         start = (now - timedelta(hours=offset)).replace(minute=0, second=0, microsecond=0)
         end = start + timedelta(hours=1)
         bucket = [row for row in recent if row["occurred_at"] and start <= as_utc(parse_date(row["occurred_at"])) < end]
         hours.append({"start": start.isoformat(), "events": len(bucket), "anomalies": sum(1 for row in bucket if row["anomalous"])})
-    by_identity: dict[tuple[int, str], list[Any]] = {}
-    for row in events:
-        by_identity.setdefault((row["credential_id"], row["identity_external_id"]), []).append(row)
-    anomalies = []
-    for row in findings:
-        identity_events = by_identity.get((row["credential_id"], row["identity_external_id"] or ""), [])
-        matched = [item for item in identity_events if item["anomalous"] and (item["resource_id"] or "") == (row["resource_id"] or "")
-                   and item["description"] and item["description"] in row["description"]]
-        latest = matched[0] if matched else None
-        category = classify_event(latest["method"], bool(latest["denied"]), latest["occurred_at"]) if latest else "Operação sensível"
-        deviation = round(max((item["risk_score"] for item in matched), default=0.9 if row["severity"] == "critical" else 0.8) * 100)
-        baseline = [item for item in identity_events if not item["anomalous"]]
-        expected = (f"Média de {len(baseline) / 7:.1f} evento(s) administrativos por dia desta identidade nos últimos 7 dias"
-                    if baseline else "Sem atividade administrativa regular desta identidade no período coletado")
-        observed = (f"{len(matched)} ocorrência(s) de {latest['method'] or 'operação'} em {latest['resource_id'] or 'ambiente'}"
-                    + (f" · IP {latest['caller_ip']}" if latest and latest["caller_ip"] else "")) if latest else row["description"]
-        anomalies.append({"id": row["id"], "occurredAt": latest["occurred_at"] if latest else row["created_at"],
-                          "identityId": row["identity_external_id"],
-                          "who": labels.get((row["credential_id"], row["identity_external_id"]), row["identity_external_id"]),
-                          "provider": row["provider"], "category": category, "title": row["description"].split(". ", 1)[-1],
-                          "deviation": deviation, "confidence": "alta confiança" if deviation >= 80 else "média confiança",
-                          "expected": expected, "observed": observed, "status": row["status"],
-                          "privileged": (row["credential_id"], row["identity_external_id"]) in privileged})
     categories: dict[str, int] = {}
     for item in anomalies:
         categories[item["category"]] = categories.get(item["category"], 0) + 1
@@ -2397,8 +2539,7 @@ def ueba_overview(credential_id: int | None = None) -> dict[str, Any]:
                      "privilegedIdentities": len({item["identityId"] for item in anomalies if item["privileged"]}),
                      "eventsEvaluated": coverage["eventsEvaluated"]},
             "categories": [{"name": name, "count": count} for name, count in sorted(categories.items(), key=lambda entry: -entry[1])],
-            "anomalies": sorted(anomalies, key=lambda item: item["occurredAt"] or "", reverse=True),
-            "coverage": coverage["environments"]}
+            "anomalies": anomalies, "coverage": coverage["environments"]}
 
 
 @app.get("/api/ueba")

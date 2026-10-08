@@ -46,6 +46,8 @@ A suíte usa banco temporário isolado e cobre o fluxo completo sem alterar os d
 
 O Docker Compose instala o `qwen3:1.7b` no Ollama e mantém o modelo no volume `ollama-data`. O modelo recebe somente metadados normalizados de acessos e riscos, nunca o JSON secreto da credencial. A análise generativa explica a correlação; criticidade, recomendação e tratativa permanecem protegidas pelas regras determinísticas da plataforma.
 
+Nas anomalias UEBA, as regras explicam cada caso em linguagem clara (quem, o quê, onde, quantas vezes, ritmo, resultado, por que é anomalia, interpretação provável e o que fazer) e o Qwen escreve um resumo para gestores usando apenas esses fatos. O resumo só é exibido se passar pelas proteções: não pode citar e-mails, IPs, permissões ou números ausentes dos fatos, nem afirmar ritmo, normalidade, ataque ou resultado que contradiga o log; caso contrário, a tela mostra apenas a explicação das regras. Os resumos são gerados em segundo plano após cada análise (`AI_PREGENERATE=0` desativa) e ficam em cache.
+
 ## Pré-visualizar o frontend sem Docker
 
 Não há dependências. Abra `index.html` diretamente ou sirva a pasta:

@@ -17,7 +17,7 @@ const state = {
   acc: { view: 'grants', prov: 'all', unused: false, q: '', grants: [], summary: null, projects: null, roles: null, accounts: null },
   risk: { rule: 'all', severity: null, findings: [], rules: [], ai: [] },
   priv: { rows: [], summary: null, standing: false, role: null },
-  ueba: { data: null, category: null, selected: null },
+  ueba: { data: null, category: null, selected: null, generating: null, attempted: new Set() },
   audit: { data: null, source: null, result: 'all', q: '', selected: null },
   comp: { fw: 'iso', frameworks: [], campaigns: [] },
   admin: { settings: null, users: [] },
@@ -577,12 +577,34 @@ function renderUeba() {
   const aside = $('#ueba-aside'); aside.hidden = !selected;
   if (selected) {
     const readonly = isReadonly();
-    setHTML(aside, `<div><div class="card-kicker">${escapeHtml(selected.category)} · ${hourMinute(selected.occurredAt)}</div><div class="aside-title sm">${escapeHtml(selected.title)}</div><div class="muted-sm">${escapeHtml(selected.who)} · ${escapeHtml(selected.provider)}</div></div>
+    const generating = !selected.summary && u.generating === selected.id;
+    const model = selected.engine.replace('+guardrails', '');
+    const summary = selected.summary
+      ? `<div class="explain-block summary"><span class="overline">Resumo · IA local (${escapeHtml(model)})</span><p>${escapeHtml(selected.summary)}</p></div>`
+      : generating ? '<div class="note">Gerando resumo com a IA local (Qwen)…</div>' : '';
+    const block = (label, text) => text ? `<div class="explain-block"><span class="overline">${label}</span><p>${escapeHtml(text)}</p></div>` : '';
+    setHTML(aside, `<div><div class="card-kicker">${escapeHtml(selected.category)} · ${formatDate(selected.occurredAt)}</div><div class="aside-title sm">${escapeHtml(selected.title)}</div><div class="muted-sm break">${escapeHtml(selected.who)} · ${escapeHtml(selected.provider)}</div></div>
+      ${summary}
+      ${block('O que aconteceu', selected.happened)}
       <div class="exp-obs"><div><span class="lbl">Esperado</span><span class="val">${escapeHtml(selected.expected)}</span></div><div><span class="lbl red">Observado</span><span class="val obs">${escapeHtml(selected.observed)}</span></div></div>
       <div class="dev-big"><b>${selected.deviation}</b><span>pontuação de desvio · ${escapeHtml(selected.confidence)}</span></div>
+      ${block('Por que é anomalia', selected.why)}
+      ${block('Interpretação provável', selected.interpretation)}
+      ${selected.actions?.length ? `<div class="explain-block"><span class="overline">O que fazer</span><ol class="actions">${selected.actions.map(action => `<li>${escapeHtml(action)}</li>`).join('')}</ol></div>` : ''}
+      <div class="note">Detalhes calculados pelas regras da plataforma a partir dos logs de auditoria${selected.summary ? '; o resumo foi escrito pela IA local usando somente esses fatos' : ''}.</div>
       <div class="semibold">Status: ${selected.status === 'incident' ? 'Incidente aberto' : 'Em análise'}</div>
       ${readonly ? '' : `<div class="stack-6 push-bottom"><button type="button" class="btn btn-primary btn-block" data-ueba-incident="${selected.id}"${selected.status === 'incident' ? ' disabled' : ''}>Abrir incidente</button><button type="button" class="btn btn-secondary btn-block" data-ueba-expected="${selected.id}">Marcar como comportamento esperado</button></div>`}`);
+    if (!selected.summary && u.generating !== selected.id && !u.attempted.has(selected.id)) explainAnomaly(selected.id);
   }
+}
+async function explainAnomaly(id) {
+  const u = state.ueba; u.generating = id; u.attempted.add(id);
+  try {
+    const result = await api(`/ueba/${id}/explanation`, { method: 'POST' });
+    const item = u.data?.anomalies.find(entry => entry.id === id);
+    if (item) Object.assign(item, { summary: result.summary, engine: result.engine });
+  } catch { /* the rule-based explanation stays on screen */ }
+  finally { if (u.generating === id) u.generating = null; if (state.page === 'ueba' && u.selected === id) renderUeba(); }
 }
 
 /* ══ Credenciais ═════════════════════════════════════════════════════ */

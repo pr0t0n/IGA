@@ -10,6 +10,7 @@ os.environ.setdefault("JWT_SECRET", "automated-test-jwt-secret-longer-than-32-by
 os.environ.setdefault("ADMIN_EMAIL", "admin@test.local")
 os.environ.setdefault("ADMIN_PASSWORD", "automated-admin-password")
 os.environ.setdefault("SCHEDULER_ENABLED", "0")
+os.environ.setdefault("AI_PREGENERATE", "0")
 
 from fastapi.testclient import TestClient
 
@@ -435,7 +436,26 @@ class PlatformEndToEndTest(unittest.TestCase):
         self.assertEqual(len(ueba["hours"]), 24)
         self.assertEqual(ueba["anomalies"][0]["category"], "Escalada de privilégio")
         self.assertIn("SetIamPolicy", ueba["anomalies"][0]["observed"])
-        self.assertEqual(self.client.patch(f"/api/findings/{ueba['anomalies'][0]['id']}", json={"status": "incident"}).status_code, 200)
+        anomaly = ueba["anomalies"][0]
+        self.assertEqual(anomaly["engine"], "regras")
+        self.assertIn("builder", anomaly["happened"])
+        self.assertTrue(anomaly["actions"])
+        llm = Mock()
+        llm.raise_for_status.return_value = None
+        llm.json.return_value = {"message": {"content": json.dumps({"resumo": "O acesso veio do IP 10.9.9.9 e parece um ataque em andamento."})}}
+        with patch("main.requests.post", return_value=llm):
+            rejected = self.client.post(f"/api/ueba/{anomaly['id']}/explanation").json()
+        self.assertEqual((rejected["engine"], rejected["summary"]), ("regras", ""))
+        llm.json.return_value = {"message": {"content": json.dumps({
+            "resumo": "A conta builder alterou permissões de acesso no projeto prod sem um processo aprovado; confirme com o responsável qual vínculo mudou."})}}
+        with patch("main.requests.post", return_value=llm):
+            explained = self.client.post(f"/api/ueba/{anomaly['id']}/explanation").json()
+        self.assertIn("guardrails", explained["engine"])
+        self.assertTrue(explained["summary"].startswith("A conta builder"))
+        self.assertEqual(explained["happened"], anomaly["rules"]["happened"])
+        self.assertTrue(self.client.post(f"/api/ueba/{anomaly['id']}/explanation").json()["cached"])
+        self.assertEqual(self.client.get(f"/api/ueba/overview?credential_id={credential_id}").json()["anomalies"][0]["summary"], explained["summary"])
+        self.assertEqual(self.client.patch(f"/api/findings/{anomaly['id']}", json={"status": "incident"}).status_code, 200)
 
         trail = self.client.get("/api/audit/trail").json()
         self.assertEqual([item["name"] for item in trail["sources"]], ["Plataforma", "GCP Audit Logs", "AWS CloudTrail", "Azure Activity Log"])
