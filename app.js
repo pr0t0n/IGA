@@ -413,11 +413,19 @@ function renderAccesses() {
   const byProvider = s.byProvider.map(p => p.withUsage
     ? `<div class="stack-6"><div class="fw-row-top"><span class="semibold">${escapeHtml(p.provider)}</span><span class="strong">${pct(p.unused, p.withUsage)}%</span></div>${bar(pct(p.unused, p.withUsage), 'var(--color-accent)', 'bar-8')}<div class="muted-sm">${fmt(p.unused)} de ${fmt(p.withUsage)} concessões com telemetria${p.granted ? ` · ${pct(p.used, p.granted)}% das permissões exercidas` : ''}</div>${p.usageHint ? `<div class="note">${escapeHtml(p.usageLabel)}. ${escapeHtml(p.usageHint)}</div>` : ''}</div>`
     : `<div class="stack-6"><div class="fw-row-top"><span class="semibold">${escapeHtml(p.provider)}</span><span class="strong">—</span></div>${bar(0, '', 'bar-8')}<div class="muted-sm">Sem dados de uso para ${fmt(p.total)} concessões.</div></div>`).join('') || '<div class="empty">Nenhuma concessão coletada.</div>';
-  const missingUsage = s.byProvider.some(p => !p.withUsage);
+  // The side panel only shows what was collected: usage appears when a provider reports it.
+  const hasUsage = s.withUsage > 0;
+  const privileged = a.grants.filter(g => g.privileged).length;
+  const roleCounts = {};
+  a.grants.forEach(g => { roleCounts[g.role] = (roleCounts[g.role] || 0) + 1; });
+  const topRoles = Object.entries(roleCounts).sort((x, y) => y[1] - x[1]).slice(0, 6);
+  const maxRole = Math.max(1, ...topRoles.map(([, n]) => n));
   setHTML('#acc-side', `
-    <div class="stack-12"><div><div class="card-kicker">Uso real</div><div class="card-title">Concessões sem uso (${s.unusedDays} dias)</div></div>${byProvider}${missingUsage ? '<button type="button" class="btn btn-ghost btn-xs" data-nav="credenciais">Ver coleta na integração →</button>' : ''}</div>
+    ${hasUsage ? `<div class="stack-12"><div><div class="card-kicker">Uso real</div><div class="card-title">Concessões sem uso (${s.unusedDays} dias)</div></div>${byProvider}</div>` : ''}
+    <div class="stack-10${hasUsage ? ' divider-top' : ''}"><div><div class="card-kicker">Concessões</div><div class="card-title">Nível das concessões</div></div><div class="split-bar">${s.total ? `<span class="accent" data-w="${pct(privileged, s.total)}%"></span><span class="gray" data-w="${100 - pct(privileged, s.total)}%"></span>` : '<span class="gray" data-w="100%"></span>'}</div><div class="split-legend"><span><b>${fmt(privileged)}</b> privilegiadas (${pct(privileged, s.total)}%)</span><span><b>${fmt(s.total - privileged)}</b> padrão</span></div><div class="note">${fmt(s.wildcard)} concessões com permissões irrestritas (owner, AdministratorAccess ou *).</div></div>
     <div class="stack-10 divider-top"><div class="card-title">Origem das concessões</div><div class="split-bar">${s.total ? `<span class="ink" data-w="${pct(s.direct, s.total)}%"></span><span class="gray" data-w="${100 - pct(s.direct, s.total)}%"></span>` : '<span class="gray" data-w="100%"></span>'}</div><div class="split-legend"><span><b>${fmt(s.direct)}</b> diretas (${pct(s.direct, s.total)}%)</span><span><b>${fmt(s.group)}</b> via grupo (${pct(s.group, s.total)}%)</span></div><div class="note">Concessões diretas a pessoas dificultam a revisão. Prefira grupos e papéis.</div></div>
-    <button type="button" class="btn btn-primary btn-block" data-go-rule="PERMISSION_USAGE">Ver achados de uso real</button>`);
+    <div class="stack-10 divider-top"><div class="card-title">Papéis mais concedidos</div>${topRoles.map(([role, n]) => `<button type="button" class="rule-row" data-acc-role="${escapeHtml(role)}"><span class="rule-name mono" title="${escapeHtml(role)}">${escapeHtml(role)}</span><span class="rule-n">${fmt(n)}</span>${bar(n / maxRole * 100, '', 'bar-4 full')}</button>`).join('') || '<div class="empty">Nenhuma concessão coletada.</div>'}</div>
+    ${hasUsage ? '<button type="button" class="btn btn-primary btn-block" data-go-rule="PERMISSION_USAGE">Ver achados de uso real</button>' : ''}`);
   const providerOk = provider => a.prov === 'all' || provider === a.prov;
   let table = ''; let total = 0; let shownCount = 0; let note = '';
   if (a.view === 'grants') {
@@ -886,6 +894,7 @@ $('#id-export').addEventListener('click', () => downloadCsv('identidades-nexo-ig
 // Acessos
 $$('input[name="acc-view"]').forEach(radio => radio.addEventListener('change', async () => { if (!radio.checked) return; state.acc.view = radio.value; try { await loadAccessView(); } catch (error) { toast(error.message); } renderAccesses(); }));
 $$('input[name="acc-prov"]').forEach(radio => radio.addEventListener('change', () => { if (radio.checked) { state.acc.prov = radio.value; renderAccesses(); } }));
+$('#acc-side').addEventListener('click', event => { const role = event.target.closest('[data-acc-role]'); if (role) { state.acc.q = role.dataset.accRole; $('#acc-search').value = role.dataset.accRole; renderAccesses(); $('#acc-table').scrollIntoView({ block: 'start' }); } });
 $('#acc-unused').addEventListener('change', event => { state.acc.unused = event.target.checked; renderAccesses(); });
 let accSearchTimer;
 $('#acc-search').addEventListener('input', event => { clearTimeout(accSearchTimer); accSearchTimer = setTimeout(() => { state.acc.q = event.target.value; renderAccesses(); }, 180); });
