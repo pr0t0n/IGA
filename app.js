@@ -16,7 +16,7 @@ const state = {
   ids: { list: [], summary: null, type: 'all', provider: 'all', q: '', selected: null, detail: null },
   acc: { view: 'grants', prov: 'all', unused: false, q: '', grants: [], summary: null, projects: null, roles: null, accounts: null },
   risk: { rule: 'all', severity: null, findings: [], rules: [], ai: [] },
-  priv: { rows: [], summary: null, standing: false },
+  priv: { rows: [], summary: null, standing: false, role: null },
   ueba: { data: null, category: null, selected: null },
   audit: { data: null, source: null, result: 'all', q: '', selected: null },
   comp: { fw: 'iso', frameworks: [], campaigns: [] },
@@ -516,19 +516,21 @@ function renderPrivileged() {
     stat('Break-glass', fmt(s.breakGlass), 'identificadas pelo nome'),
   ].join(''));
   const maxRole = Math.max(1, ...s.roles.map(r => r.count));
-  setHTML('#priv-roles', `<div><div class="card-kicker">Papéis</div><div class="card-title">Papéis de alto impacto</div></div>${s.roles.map(r => `<div class="role-row"><span><span class="mono semibold">${escapeHtml(r.role)}</span> <span class="muted">· ${escapeHtml(r.provider)}</span></span><span>${fmt(r.count)}</span>${bar(r.count / maxRole * 100, '', 'bar-4 full')}</div>`).join('') || '<div class="empty">Nenhum papel privilegiado coletado.</div>'}<div class="stack-10 divider-top"><div class="card-title">Modelo de acesso</div><div class="split-bar">${s.grants ? `<span class="accent" data-w="${pct(s.standing, s.grants)}%"></span><span class="gray" data-w="${100 - pct(s.standing, s.grants)}%"></span>` : '<span class="gray" data-w="100%"></span>'}</div><div class="split-legend"><span><b>${fmt(s.standing)}</b> permanentes</span><span><b>${fmt(s.jit)}</b> JIT solicitado</span></div></div>`);
-  const rows = p.rows.filter(row => !p.standing || row.model === 'Permanente'); const shown = pageOf('priv', rows, String(p.standing)); const readonly = isReadonly();
+  setHTML('#priv-roles', `<div><div class="card-kicker">Papéis</div><div class="card-title">Papéis de alto impacto</div></div>${s.roles.map(r => { const active = p.role?.role === r.role && p.role?.provider === r.provider; return `<button type="button" class="role-row role-btn${active ? ' active' : ''}" data-priv-role="${escapeHtml(r.role)}" data-priv-provider="${escapeHtml(r.provider)}" aria-pressed="${active}" title="${active ? 'Remover filtro' : 'Filtrar a tabela por este papel'}"><span><span class="mono semibold">${escapeHtml(r.role)}</span> <span class="muted">· ${escapeHtml(r.provider)}</span></span><span>${fmt(r.count)}</span>${bar(r.count / maxRole * 100, '', 'bar-4 full')}</button>`; }).join('') || '<div class="empty">Nenhum papel privilegiado coletado.</div>'}<div class="stack-10 divider-top"><div class="card-title">Modelo de acesso</div><div class="split-bar">${s.grants ? `<span class="accent" data-w="${pct(s.standing, s.grants)}%"></span><span class="gray" data-w="${100 - pct(s.standing, s.grants)}%"></span>` : '<span class="gray" data-w="100%"></span>'}</div><div class="split-legend"><span><b>${fmt(s.standing)}</b> permanentes</span><span><b>${fmt(s.jit)}</b> JIT solicitado</span></div></div>`);
+  const rows = p.rows.filter(row => (!p.standing || row.model === 'Permanente') && (!p.role || (row.role === p.role.role && row.provider === p.role.provider)));
+  const shown = pageOf('priv', rows, `${p.standing}|${p.role?.role || ''}|${p.role?.provider || ''}`); const readonly = isReadonly();
+  setHTML('#priv-filter', p.role ? `<span class="filter-chip">Papel: <b class="mono">${escapeHtml(p.role.role)}</b> · ${escapeHtml(p.role.provider)} · ${fmt(rows.length)} concessão(ões)<button type="button" class="filter-chip-x" data-priv-clear aria-label="Remover filtro de papel">×</button></span>` : '');
   const hasMfa = p.rows.some(row => row.mfaEnabled !== null); const hasUse = p.rows.some(row => row.lastUsedAt);
   setHTML('#priv-table', tableHTML('', [
     { head: 'Identidade', cell: row => `<td class="semibold break">${escapeHtml(row.identityName)}<div class="t-sub">${TYPE_LABEL[row.identityType] || escapeHtml(row.identityType || '—')}</div></td>` },
-    { head: 'Papel', cell: row => `<td class="mono break">${escapeHtml(row.role)}</td>` },
+    { head: 'Papel', show: !p.role, cell: row => `<td class="mono break">${escapeHtml(row.role)}</td>` },
     { head: 'Escopo', cell: row => `<td class="break">${escapeHtml(row.resourceName)} <span class="muted">· ${escapeHtml(row.provider)}</span></td>` },
     { head: 'Modelo', cell: row => `<td><span class="tag ${row.model === 'Permanente' ? 'tag-accent' : 'tag-neutral'}">${escapeHtml(row.model)}</span></td>` },
     { head: 'MFA', show: hasMfa, cell: row => `<td class="${row.mfaEnabled === false ? 'mfa-no' : row.mfaEnabled ? 'mfa-yes' : 'muted'}">${row.mfaEnabled === false ? 'Não' : row.mfaEnabled ? 'Sim' : '—'}</td>` },
     { head: 'Último uso', show: hasUse, cell: row => `<td class="muted nowrap">${row.lastUsedAt ? ago(row.lastUsedAt) : '—'}</td>` },
     { head: 'Risco', right: true, cell: row => `<td class="right strong num" title="Base pela criticidade do papel, +10 sem MFA, +5 sem uso">${row.riskScore}</td>` },
     { head: '', cell: row => `<td class="right"><div class="row-actions vertical">${!readonly && row.model === 'Permanente' ? `<button type="button" class="btn btn-secondary btn-sm" data-jit="${row.id}">Converter para JIT</button>` : ''}<button type="button" class="btn btn-ghost btn-sm" data-dossier="${row.id}">Ver contexto</button></div></td>` },
-  ], shown, null, p.rows.length ? 'Nenhuma conta com acesso permanente.' : 'Nenhum acesso privilegiado coletado.'));
+  ], shown, null, p.rows.length ? (p.role ? 'Nenhuma conta com este papel para os filtros atuais.' : 'Nenhuma conta com acesso permanente.') : 'Nenhum acesso privilegiado coletado.'));
   setHTML('#priv-foot', pagerHTML('priv', rows.length, hiddenNote([!hasMfa && 'MFA', !hasUse && 'último uso'].filter(Boolean))));
 }
 async function openDossier(id) {
@@ -897,6 +899,13 @@ $('#risk-rows').addEventListener('click', async event => {
 
 // Privilegiado
 $('#priv-standing').addEventListener('change', event => { state.priv.standing = event.target.checked; renderPrivileged(); });
+$('#priv-roles').addEventListener('click', event => {
+  const button = event.target.closest('[data-priv-role]'); if (!button) return;
+  const { privRole: role, privProvider: provider } = button.dataset; const current = state.priv.role;
+  state.priv.role = current && current.role === role && current.provider === provider ? null : { role, provider };
+  renderPrivileged();
+});
+$('#priv-filter').addEventListener('click', event => { if (event.target.closest('[data-priv-clear]')) { state.priv.role = null; renderPrivileged(); } });
 $('#priv-table').addEventListener('click', async event => {
   const dossier = event.target.closest('[data-dossier]'); if (dossier) { openDossier(Number(dossier.dataset.dossier)); return; }
   const jit = event.target.closest('[data-jit]'); if (!jit) return;

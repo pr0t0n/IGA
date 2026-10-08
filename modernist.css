@@ -375,6 +375,14 @@ dialog.dialog::backdrop { background: color-mix(in srgb, var(--color-neutral-900
 .role-row { display: grid; grid-template-columns: minmax(0, 1fr) 44px; gap: 4px 12px; padding: 6px 0; border-bottom: 1px solid var(--color-divider); }
 .role-row > span:first-child { font-size: 13px; overflow-wrap: anywhere; }
 .role-row > span:nth-child(2) { text-align: right; font-weight: 800; }
+.role-btn { width: 100%; border: 0; border-bottom: 1px solid var(--color-divider); background: transparent; font: inherit; color: inherit; text-align: left; cursor: pointer; padding: 6px 4px; }
+.role-btn:hover { background: color-mix(in srgb, var(--color-text) 6%, transparent); }
+.role-btn:focus-visible { outline: 2px solid var(--color-accent); outline-offset: -2px; }
+.role-btn.active, .role-btn.active:hover { background: var(--color-accent-100); }
+.filter-chip { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; padding: 4px 4px 4px 10px; background: var(--color-accent-100); color: var(--color-accent-800); overflow-wrap: anywhere; }
+.filter-chip b { font-weight: 600; }
+.filter-chip-x { border: 0; background: transparent; color: inherit; font: 800 16px var(--font-body); width: 26px; height: 26px; cursor: pointer; display: grid; place-items: center; }
+.filter-chip-x:hover { background: color-mix(in srgb, var(--color-accent) 15%, transparent); }
 .mfa-no { font-weight: 800; color: var(--color-accent-700); }
 .mfa-yes { font-weight: 800; }
 

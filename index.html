@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="modernist.css?v=20261008-r3">
+  <link rel="stylesheet" href="modernist.css?v=20261008-r5">
 </head>
 <body class="locked" data-page="dashboard">
   <div class="app">
@@ -120,6 +120,7 @@
           <section class="cell gap-12" data-flex="1 1 320px" id="priv-roles"></section>
           <section class="cell gap-12" data-flex="2.4 1 620px">
             <div class="cell-head"><div><div class="card-kicker">Contas</div><div class="card-title">Contas privilegiadas por risco</div></div><label class="check"><input type="checkbox" id="priv-standing">Somente acesso permanente</label></div>
+            <div id="priv-filter" aria-live="polite"></div>
             <div class="table-wrap" id="priv-table"></div>
             <div class="foot-text" id="priv-foot"></div>
           </section>
@@ -361,6 +362,6 @@
   </dialog>
 
   <div id="toast" role="status" aria-live="polite"></div>
-  <script src="app.js?v=20261008-r3"></script>
+  <script src="app.js?v=20261008-r5"></script>
 </body>
 </html>
