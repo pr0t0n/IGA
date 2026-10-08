@@ -362,6 +362,7 @@ dialog.dialog::backdrop { background: color-mix(in srgb, var(--color-neutral-900
 .rule-info-crit { flex: 1 1 220px; display: flex; flex-direction: column; gap: 2px; }
 .rule-info-crit b { font-size: 14px; font-weight: 600; }
 .row-actions { display: flex; gap: 4px; justify-content: flex-end; flex-wrap: wrap; }
+.row-actions.vertical { flex-direction: column; align-items: flex-end; flex-wrap: nowrap; }
 .ai-box { border-top: 2px solid var(--color-text); padding-top: 12px; display: flex; flex-direction: column; gap: 8px; }
 .ai-grid { display: grid; grid-template-columns: 140px 1fr; gap: 6px 16px; font-size: 14px; }
 .ai-grid dt { color: var(--color-neutral-700); }

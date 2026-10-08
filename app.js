@@ -104,6 +104,12 @@ const isReadonly = () => ['auditor', 'reader'].includes(state.user?.role);
 const stat = (label, value, sub, alertValue = false, extra = '') => `<div class="stat"${extra}><div class="stat-label">${escapeHtml(label)}</div><div class="stat-value${alertValue ? ' alert-value' : ''}">${escapeHtml(value)}</div><div class="stat-sub">${sub}</div></div>`;
 const emptyRow = (cols, text) => `<tr class="empty-row"><td colspan="${cols}">${escapeHtml(text)}</td></tr>`;
 
+// Columns flagged with `show: false` are dropped: a column the provider never fills is noise, not information.
+function tableHTML(cls, columns, rows, rowAttrs, emptyText) {
+  const cols = columns.filter(c => c.show !== false);
+  return `<table class="table ${cls}"><thead><tr>${cols.map(c => `<th${c.right ? ' class="right"' : ''}>${c.head}</th>`).join('')}</tr></thead><tbody>${rows.map(r => `<tr${rowAttrs ? rowAttrs(r) : ''}>${cols.map(c => c.cell(r)).join('')}</tr>`).join('') || emptyRow(cols.length, emptyText)}</tbody></table>`;
+}
+function hiddenNote(labels) { return labels.length ? `Colunas ocultas por falta de dados do provedor: ${labels.join(', ')}.` : ''; }
 function paint(root = document) {
   root.querySelectorAll('[data-flex],[data-w],[data-h],[data-bg],[data-left],[data-top],[data-cols]').forEach(el => {
     const d = el.dataset;
@@ -318,15 +324,27 @@ function renderIdentities() {
     stat('Humanas', fmt(s.humans), `${pct(s.humans, s.total)}% do inventário`),
     stat('De serviço', fmt(s.services), 'service accounts, roles, apps'),
     stat('Órfãs', fmt(s.orphan), 'sem responsável ativo', true),
-    stat('Sem MFA', fmt(s.noMfa), s.mfaKnown ? `de ${fmt(s.mfaKnown)} humanas com MFA informado` : 'MFA não informado pelo provedor', true),
-    stat('Inativas > 90 dias', fmt(s.inactive90), s.lastSeenKnown ? 'candidatas a desativação' : 'último login não informado'),
+    s.mfaKnown ? stat('Sem MFA', fmt(s.noMfa), `de ${fmt(s.mfaKnown)} humanas com MFA informado`, true) : stat('Sem MFA', '—', 'MFA não informado pelo provedor'),
+    s.lastSeenKnown ? stat('Inativas > 90 dias', fmt(s.inactive90), `de ${fmt(s.lastSeenKnown)} com último login conhecido`) : stat('Inativas > 90 dias', '—', 'último login não informado'),
   ].join(''));
   $('#id-count').textContent = `${fmt(shown.length)} de ${fmt(s.total)} exibidas${rows.length > ROW_LIMIT ? ` · refine a busca para ver as ${fmt(rows.length - ROW_LIMIT)} restantes` : ''}`;
-  setHTML('#id-rows', shown.map(item => `<tr class="clickable${item.id === state.ids.selected ? ' selected' : ''}" data-identity="${item.id}"><td><div class="semibold break">${escapeHtml(item.name)}</div>${(item.email || item.externalId) !== item.name ? `<div class="t-sub break">${escapeHtml(item.email || item.externalId)}</div>` : ''}</td><td>${TYPE_LABEL[item.type] || escapeHtml(item.type)}</td><td><span class="tag tag-neutral">${escapeHtml(item.provider)}</span></td><td>${escapeHtml(item.environment)}</td><td class="right num">${fmt(item.accessCount)}</td><td><div class="score-cell"><b>${item.riskScore}</b>${bar(item.riskScore, riskColor(item.riskScore))}</div></td><td>${lifecycleTag(item)}</td><td class="muted nowrap">${ago(item.lastSeenAt)}</td></tr>`).join('') || emptyRow(8, state.ids.list.length ? 'Nenhuma identidade corresponde aos filtros.' : 'Execute uma análise para preencher o inventário.'));
+  const seen = state.ids.list.some(item => item.lastSeenAt);
+  const multiProvider = new Set(state.ids.list.map(item => item.provider)).size > 1;
+  const multiEnvironment = new Set(state.ids.list.map(item => item.environment)).size > 1;
+  setHTML('#id-table', tableHTML('', [
+    { head: 'Identidade', cell: item => `<td><div class="semibold break">${escapeHtml(item.name)}</div>${(item.email || item.externalId) !== item.name ? `<div class="t-sub break">${escapeHtml(item.email || item.externalId)}</div>` : ''}</td>` },
+    { head: 'Tipo', cell: item => `<td>${TYPE_LABEL[item.type] || escapeHtml(item.type)}</td>` },
+    { head: 'Provedor', show: multiProvider, cell: item => `<td><span class="tag tag-neutral">${escapeHtml(item.provider)}</span></td>` },
+    { head: 'Ambiente', show: multiEnvironment, cell: item => `<td>${escapeHtml(item.environment)}</td>` },
+    { head: 'Acessos', right: true, cell: item => `<td class="right num">${fmt(item.accessCount)}</td>` },
+    { head: 'Risco', cell: item => `<td><div class="score-cell"><b>${item.riskScore}</b>${bar(item.riskScore, riskColor(item.riskScore))}</div></td>` },
+    { head: 'Ciclo de vida', cell: item => `<td>${lifecycleTag(item)}</td>` },
+    { head: 'Último login', show: seen, cell: item => `<td class="muted nowrap">${ago(item.lastSeenAt)}</td>` },
+  ], shown, item => ` class="clickable${item.id === state.ids.selected ? ' selected' : ''}" data-identity="${item.id}"`, state.ids.list.length ? 'Nenhuma identidade corresponde aos filtros.' : 'Execute uma análise para preencher o inventário.'));
 }
 async function selectIdentity(id) {
   state.ids.selected = id;
-  $$('#id-rows tr[data-identity]').forEach(row => row.classList.toggle('selected', Number(row.dataset.identity) === id));
+  $$('#id-table tr[data-identity]').forEach(row => row.classList.toggle('selected', Number(row.dataset.identity) === id));
   const aside = $('#id-aside'); aside.hidden = false;
   setHTML(aside, '<div class="muted">Carregando identidade…</div>');
   try {
@@ -384,11 +402,22 @@ function renderAccesses() {
     <div class="stack-10 divider-top"><div class="card-title">Origem das concessões</div><div class="split-bar">${s.total ? `<span class="ink" data-w="${pct(s.direct, s.total)}%"></span><span class="gray" data-w="${100 - pct(s.direct, s.total)}%"></span>` : '<span class="gray" data-w="100%"></span>'}</div><div class="split-legend"><span><b>${fmt(s.direct)}</b> diretas (${pct(s.direct, s.total)}%)</span><span><b>${fmt(s.group)}</b> via grupo (${pct(s.group, s.total)}%)</span></div><div class="note">Concessões diretas a pessoas dificultam a revisão. Prefira grupos e papéis.</div></div>
     <button type="button" class="btn btn-primary btn-block" data-go-rule="PERMISSION_USAGE">Ver achados de uso real</button>`);
   const providerOk = provider => a.prov === 'all' || provider === a.prov;
-  let table = ''; let total = 0; let shownCount = 0;
+  let table = ''; let total = 0; let shownCount = 0; let note = '';
   if (a.view === 'grants') {
     const rows = a.grants.filter(g => providerOk(g.provider) && (!a.unused || isStale(g)) && accessMatches(`${g.identityName} ${g.identityId} ${g.resourceName} ${g.role}`));
     total = rows.length; const shown = rows.slice(0, ROW_LIMIT); shownCount = shown.length;
-    table = `<table class="table min-900"><thead><tr><th>Identidade</th><th>Recurso</th><th>Papel / permissão</th><th>Origem</th><th>Concedido</th><th>Último uso</th><th>Permissões usadas</th></tr></thead><tbody>${shown.map(g => { const stale = isStale(g); return `<tr class="${stale ? 'stale' : ''}"><td class="semibold break">${escapeHtml(g.identityName)}</td><td><div class="break">${escapeHtml(g.resourceName)}</div><div class="t-sub">${escapeHtml(g.provider)} · ${escapeHtml(g.environment)}</div></td><td><div class="mono break">${escapeHtml(g.role)}</div>${g.privileged ? '<span class="tag tag-accent">Privilegiado</span>' : ''}${g.wildcard ? ' <span class="tag tag-outline">*</span>' : ''}</td><td>${escapeHtml(g.origin)}</td><td class="muted nowrap">${g.grantedAt ? dayMonth(g.grantedAt) + '/' + new Date(g.grantedAt).getFullYear() : '—'}</td><td class="nowrap ${stale ? 'strong accent-text' : ''}">${g.lastUsedAt ? ago(g.lastUsedAt) : '<span class="muted">Sem telemetria</span>'}</td><td>${usageCell(g)}</td></tr>`; }).join('') || emptyRow(7, a.grants.length ? 'Nenhuma concessão corresponde aos filtros.' : 'Execute uma análise para preencher o inventário.')}</tbody></table>`;
+    const has = { granted: a.grants.some(g => g.grantedAt), used: a.grants.some(g => g.lastUsedAt), usage: a.grants.some(g => g.totalPermissions) };
+    note = hiddenNote([!has.granted && 'concedido', !has.used && 'último uso', !has.usage && 'permissões usadas'].filter(Boolean));
+    table = tableHTML(has.usage || has.used ? 'min-900' : 'min-720', [
+      { head: 'Identidade', cell: g => `<td><div class="semibold break">${escapeHtml(g.identityName)}</div><div class="t-sub">${TYPE_LABEL[g.identityType] || escapeHtml(g.identityType || 'Identidade')}</div></td>` },
+      { head: 'Recurso', cell: g => `<td><div class="break">${escapeHtml(g.resourceName)}</div><div class="t-sub">${escapeHtml(g.provider)} · ${escapeHtml(g.environment)}</div></td>` },
+      { head: 'Papel / permissão', cell: g => `<td class="mono break">${escapeHtml(g.role)}</td>` },
+      { head: 'Origem', cell: g => `<td>${escapeHtml(g.origin)}</td>` },
+      { head: 'Nível', cell: g => `<td>${g.privileged ? '<span class="tag tag-accent">Privilegiado</span>' : '<span class="tag tag-neutral">Padrão</span>'}${g.wildcard ? ' <span class="tag tag-outline" title="Permissão irrestrita">*</span>' : ''}</td>` },
+      { head: 'Concedido', show: has.granted, cell: g => `<td class="muted nowrap">${g.grantedAt ? `${dayMonth(g.grantedAt)}/${new Date(g.grantedAt).getFullYear()}` : '—'}</td>` },
+      { head: 'Último uso', show: has.used, cell: g => `<td class="nowrap ${isStale(g) ? 'strong accent-text' : ''}">${g.lastUsedAt ? ago(g.lastUsedAt) : '<span class="muted">—</span>'}</td>` },
+      { head: 'Permissões usadas', show: has.usage, cell: g => `<td>${g.totalPermissions ? usageCell(g) : '<span class="muted">—</span>'}</td>` },
+    ], shown, g => isStale(g) ? ' class="stale"' : '', a.grants.length ? 'Nenhuma concessão corresponde aos filtros.' : 'Execute uma análise para preencher o inventário.');
   } else if (a.view === 'projects') {
     const rows = (a.projects || []).filter(p => providerOk(p.provider) && accessMatches(`${p.name} ${p.resourceId} ${p.environment}`));
     total = rows.length; const shown = rows.slice(0, ROW_LIMIT); shownCount = shown.length;
@@ -403,7 +432,7 @@ function renderAccesses() {
     table = `<table class="table min-900"><thead><tr><th>Conta</th><th>Ambiente</th><th>Tipo</th><th>Estado</th><th class="right">Recursos</th><th class="right">Concessões</th><th class="right">Privilegiadas</th><th class="right">Riscos</th><th></th></tr></thead><tbody>${shown.map(r => `<tr><td><div class="semibold break">${escapeHtml(r.name)}</div><div class="t-sub break">${escapeHtml(r.externalId)}</div></td><td>${escapeHtml(r.provider)} · ${escapeHtml(r.environment)}</td><td>${TYPE_LABEL[r.type] || escapeHtml(r.type)}</td><td>${r.enabled ? 'Ativa' : 'Desabilitada'}</td><td class="right num">${fmt(r.resourceCount)}</td><td class="right num">${fmt(r.accessCount)}</td><td class="right num">${fmt(r.privilegedCount)}</td><td class="right num">${fmt(r.findingCount)}</td><td class="right"><button type="button" class="btn btn-secondary btn-sm" data-open-identity="${r.id}">Ver identidade</button></td></tr>`).join('') || emptyRow(9, 'Nenhuma conta coletada.')}</tbody></table>`;
   }
   setHTML('#acc-table', table);
-  $('#acc-foot').textContent = total > shownCount ? `Exibindo ${fmt(shownCount)} de ${fmt(total)}. Use a busca para refinar.` : `${fmt(total)} registro(s).`;
+  $('#acc-foot').textContent = `${total > shownCount ? `Exibindo ${fmt(shownCount)} de ${fmt(total)}. Use a busca para refinar.` : `${fmt(total)} registro(s).`} ${note}`.trim();
 }
 async function openProject(credentialId, resourceId) {
   const modal = $('#project-modal'); const content = $('#project-content');
@@ -472,15 +501,25 @@ function renderPrivileged() {
     stat('Contas privilegiadas', fmt(s.identities), `${pct(s.identities, s.totalIdentities)}% das identidades`),
     stat('Acesso permanente', fmt(s.standing), `${pct(s.standing, s.grants)}% das concessões privilegiadas`, true),
     stat('JIT solicitado', fmt(s.jit), 'conversões registradas para execução'),
-    stat('Sem MFA', fmt(s.noMfa), 'identidades privilegiadas', true),
-    stat(`Sem uso > ${unusedDays} dias`, fmt(s.unused), 'candidatas à revogação'),
+    p.rows.some(row => row.mfaEnabled !== null) ? stat('Sem MFA', fmt(s.noMfa), 'identidades privilegiadas', true) : stat('Sem MFA', '—', 'MFA não informado pelo provedor'),
+    p.rows.some(row => row.lastUsedAt) ? stat(`Sem uso > ${unusedDays} dias`, fmt(s.unused), 'candidatas à revogação') : stat(`Sem uso > ${unusedDays} dias`, '—', 'sem dados de uso dos provedores'),
     stat('Break-glass', fmt(s.breakGlass), 'identificadas pelo nome'),
   ].join(''));
   const maxRole = Math.max(1, ...s.roles.map(r => r.count));
   setHTML('#priv-roles', `<div><div class="card-kicker">Papéis</div><div class="card-title">Papéis de alto impacto</div></div>${s.roles.map(r => `<div class="role-row"><span><span class="mono semibold">${escapeHtml(r.role)}</span> <span class="muted">· ${escapeHtml(r.provider)}</span></span><span>${fmt(r.count)}</span>${bar(r.count / maxRole * 100, '', 'bar-4 full')}</div>`).join('') || '<div class="empty">Nenhum papel privilegiado coletado.</div>'}<div class="stack-10 divider-top"><div class="card-title">Modelo de acesso</div><div class="split-bar">${s.grants ? `<span class="accent" data-w="${pct(s.standing, s.grants)}%"></span><span class="gray" data-w="${100 - pct(s.standing, s.grants)}%"></span>` : '<span class="gray" data-w="100%"></span>'}</div><div class="split-legend"><span><b>${fmt(s.standing)}</b> permanentes</span><span><b>${fmt(s.jit)}</b> JIT solicitado</span></div></div>`);
   const rows = p.rows.filter(row => !p.standing || row.model === 'Permanente'); const shown = rows.slice(0, ROW_LIMIT); const readonly = isReadonly();
-  setHTML('#priv-rows', shown.map(row => `<tr><td class="semibold break">${escapeHtml(row.identityName)}<div class="t-sub">${TYPE_LABEL[row.identityType] || escapeHtml(row.identityType || '—')}</div></td><td class="mono break">${escapeHtml(row.role)}</td><td class="break">${escapeHtml(row.resourceName)} <span class="muted">· ${escapeHtml(row.provider)}</span></td><td><span class="tag ${row.model === 'Permanente' ? 'tag-accent' : 'tag-neutral'}">${escapeHtml(row.model)}</span></td><td class="${row.mfaEnabled === false ? 'mfa-no' : row.mfaEnabled ? 'mfa-yes' : 'muted'}">${row.mfaEnabled === false ? 'Não' : row.mfaEnabled ? 'Sim' : '—'}</td><td class="muted nowrap">${row.lastUsedAt ? ago(row.lastUsedAt) : 'Sem telemetria'}</td><td class="right strong num" title="Base pela criticidade do papel, +10 sem MFA, +5 sem uso">${row.riskScore}</td><td class="right"><div class="row-actions">${!readonly && row.model === 'Permanente' ? `<button type="button" class="btn btn-secondary btn-sm" data-jit="${row.id}">Converter para JIT</button>` : ''}<button type="button" class="btn btn-ghost btn-sm" data-dossier="${row.id}">Contexto</button></div></td></tr>`).join('') || emptyRow(8, p.rows.length ? 'Nenhuma conta com acesso permanente.' : 'Nenhum acesso privilegiado coletado.'));
-  $('#priv-foot').textContent = rows.length > shown.length ? `Exibindo ${fmt(shown.length)} de ${fmt(rows.length)} concessões privilegiadas.` : '';
+  const hasMfa = p.rows.some(row => row.mfaEnabled !== null); const hasUse = p.rows.some(row => row.lastUsedAt);
+  setHTML('#priv-table', tableHTML('', [
+    { head: 'Identidade', cell: row => `<td class="semibold break">${escapeHtml(row.identityName)}<div class="t-sub">${TYPE_LABEL[row.identityType] || escapeHtml(row.identityType || '—')}</div></td>` },
+    { head: 'Papel', cell: row => `<td class="mono break">${escapeHtml(row.role)}</td>` },
+    { head: 'Escopo', cell: row => `<td class="break">${escapeHtml(row.resourceName)} <span class="muted">· ${escapeHtml(row.provider)}</span></td>` },
+    { head: 'Modelo', cell: row => `<td><span class="tag ${row.model === 'Permanente' ? 'tag-accent' : 'tag-neutral'}">${escapeHtml(row.model)}</span></td>` },
+    { head: 'MFA', show: hasMfa, cell: row => `<td class="${row.mfaEnabled === false ? 'mfa-no' : row.mfaEnabled ? 'mfa-yes' : 'muted'}">${row.mfaEnabled === false ? 'Não' : row.mfaEnabled ? 'Sim' : '—'}</td>` },
+    { head: 'Último uso', show: hasUse, cell: row => `<td class="muted nowrap">${row.lastUsedAt ? ago(row.lastUsedAt) : '—'}</td>` },
+    { head: 'Risco', right: true, cell: row => `<td class="right strong num" title="Base pela criticidade do papel, +10 sem MFA, +5 sem uso">${row.riskScore}</td>` },
+    { head: '', cell: row => `<td class="right"><div class="row-actions vertical">${!readonly && row.model === 'Permanente' ? `<button type="button" class="btn btn-secondary btn-sm" data-jit="${row.id}">Converter para JIT</button>` : ''}<button type="button" class="btn btn-ghost btn-sm" data-dossier="${row.id}">Ver contexto</button></div></td>` },
+  ], shown, null, p.rows.length ? 'Nenhuma conta com acesso permanente.' : 'Nenhum acesso privilegiado coletado.'));
+  $('#priv-foot').textContent = `${rows.length > shown.length ? `Exibindo ${fmt(shown.length)} de ${fmt(rows.length)} concessões privilegiadas.` : ''} ${hiddenNote([!hasMfa && 'MFA', !hasUse && 'último uso'].filter(Boolean))}`.trim();
 }
 async function openDossier(id) {
   const modal = $('#dossier-modal'); const content = $('#dossier-content');
@@ -810,7 +849,7 @@ $$('input[name="id-type"]').forEach(radio => radio.addEventListener('change', ()
 $('#id-provider').addEventListener('change', event => { state.ids.provider = event.target.value; renderIdentities(); });
 let idSearchTimer;
 $('#id-search').addEventListener('input', event => { clearTimeout(idSearchTimer); idSearchTimer = setTimeout(() => { state.ids.q = event.target.value; renderIdentities(); }, 180); });
-$('#id-rows').addEventListener('click', event => { const row = event.target.closest('[data-identity]'); if (row) selectIdentity(Number(row.dataset.identity)); });
+$('#id-table').addEventListener('click', event => { const row = event.target.closest('[data-identity]'); if (row) selectIdentity(Number(row.dataset.identity)); });
 $('#id-aside').addEventListener('click', event => {
   if (event.target.closest('[data-close-aside]')) { state.ids.selected = null; $('#id-aside').hidden = true; renderIdentities(); return; }
   const accesses = event.target.closest('[data-identity-accesses]');
@@ -840,7 +879,7 @@ $('#risk-rows').addEventListener('click', async event => {
 
 // Privilegiado
 $('#priv-standing').addEventListener('change', event => { state.priv.standing = event.target.checked; renderPrivileged(); });
-$('#priv-rows').addEventListener('click', async event => {
+$('#priv-table').addEventListener('click', async event => {
   const dossier = event.target.closest('[data-dossier]'); if (dossier) { openDossier(Number(dossier.dataset.dossier)); return; }
   const jit = event.target.closest('[data-jit]'); if (!jit) return;
   const row = state.priv.rows.find(item => item.id === Number(jit.dataset.jit));
