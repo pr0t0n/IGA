@@ -187,5 +187,40 @@ class ConnectorNormalizationTest(unittest.TestCase):
         self.assertEqual(connectors.scope_entry("Azure", "sub-1", "ERP")["label"], "ERP")
 
 
+    def test_gcp_usage_enriches_grants_and_identities(self):
+        usage = {"status": "collected",
+                 "bindings": {("data-prod", "user:alice@example.com", "roles/editor"): {"used": 0, "total": 3200},
+                              ("data-prod", "serviceAccount:etl@data-prod.iam.gserviceaccount.com", "roles/viewer"): {"used": 12, "total": 900}},
+                 "lastAuth": {"etl@data-prod.iam.gserviceaccount.com": "2026-09-30T10:00:00Z"}}
+        identities = [{"id": "user:alice@example.com", "name": "alice@example.com", "email": "alice@example.com"},
+                      {"id": "serviceAccount:etl@data-prod.iam.gserviceaccount.com", "name": "etl", "email": "etl@data-prod.iam.gserviceaccount.com"}]
+        accesses = [{"identityId": "user:alice@example.com", "resourceId": "data-prod", "role": "roles/editor"},
+                    {"identityId": "serviceAccount:etl@data-prod.iam.gserviceaccount.com", "resourceId": "data-prod", "role": "roles/viewer"}]
+        events = [{"identityId": "alice@example.com", "timestamp": "2026-10-06T08:00:00Z"}]
+        connectors.apply_gcp_usage(usage, identities, accesses, events)
+        self.assertEqual((accesses[0]["usedPermissions"], accesses[0]["totalPermissions"], accesses[0]["unused"]), (0, 3200, True))
+        self.assertEqual(accesses[1]["lastUsedAt"], "2026-09-30T10:00:00Z")
+        self.assertNotIn("unused", accesses[1])
+        self.assertEqual(identities[0]["lastSeenAt"], "2026-10-06T08:00:00Z")
+        self.assertEqual(identities[1]["lastSeenAt"], "2026-09-30T10:00:00Z")
+
+    @patch("google.auth.transport.requests.AuthorizedSession")
+    def test_gcp_usage_reads_recommender_and_policy_analyzer(self, session_class):
+        session = session_class.return_value
+        def get(url, **_kwargs):
+            if "recommender" in url:
+                return FakeResponse({"insights": [{"content": {"member": "user:bob@example.com", "role": "roles/owner",
+                                                               "exercisedPermissions": [{"permission": "a"}], "currentTotalPermissionsCount": "8000"}}]})
+            return FakeResponse({"activities": [{"activity": {"lastAuthenticatedTime": "2026-10-01T00:00:00Z",
+                                 "serviceAccount": {"fullResourceName": "//iam.googleapis.com/projects/p/serviceAccounts/sa@p.iam.gserviceaccount.com"}}}]})
+        session.get.side_effect = get
+        usage = connectors.gcp_usage(object(), ["p"])
+        self.assertEqual(usage["status"], "collected")
+        self.assertEqual(usage["bindings"][("p", "user:bob@example.com", "roles/owner")], {"used": 1, "total": 8000})
+        self.assertEqual(usage["lastAuth"]["sa@p.iam.gserviceaccount.com"], "2026-10-01T00:00:00Z")
+        session.get.side_effect = lambda url, **_kwargs: FakeResponse({}, ok=False, status_code=403)
+        self.assertEqual(connectors.gcp_usage(object(), ["p"])["status"], "permission_denied")
+
+
 if __name__ == "__main__":
     unittest.main()

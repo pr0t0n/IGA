@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from catalog import (DEFAULT_SETTINGS, FRAMEWORKS, MODULES, RULE_DETAILS, RULE_PARAMETERS, SCHEDULES, SEVERITY_ORDER,
                      classify_event, framework_report, identity_risk, merged_settings, risk_level, risk_score)
-from connectors import REQUIREMENTS, ConnectorError, aws_expiry, describe_credential, discover, normalize_credential, probe, scope_entry
+from connectors import REQUIREMENTS, USAGE_HINT, ConnectorError, aws_expiry, describe_credential, discover, normalize_credential, probe, scope_entry
 
 DB_PATH = os.getenv("DATABASE_PATH", "/data/iga.db")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
@@ -429,6 +429,8 @@ def init_db() -> None:
             "action", "target", "result", "source", "details_json", "record_hash")})
         ensure_columns(connection, "platform_users", {"last_login_at": "TEXT"})
         ensure_columns(connection, "findings", {"updated_at": "TEXT"})
+        ensure_columns(connection, "access_grants", {"used_permissions": "INTEGER", "total_permissions": "INTEGER"})
+        ensure_columns(connection, "scans", {"usage_status": "TEXT"})
         if connection.postgres:
             connection.execute("ALTER TABLE platform_users DROP CONSTRAINT IF EXISTS platform_users_role_check")
             connection.execute("ALTER TABLE platform_users ADD CONSTRAINT platform_users_role_check "
@@ -773,9 +775,11 @@ def evaluate_rules(identities: list[dict[str, Any]], accesses: list[dict[str, An
         grants_by_identity.setdefault(identity_id, []).append(grant)
 
         unused_days = days_since(grant.get("lastUsedAt"))
-        if grant.get("unused") is True or (unused_days is not None and unused_days > limits["unused_days"]):
-            results.append(finding("PERMISSION_USAGE", "high", "Permissão sem uso real",
-                f"O acesso {grant.get('role', 'sem função')} não é utilizado há mais de {limits['unused_days']} dias.", identity_id, str(grant.get("resourceId", ""))))
+        stale = unused_days is not None and unused_days > limits["unused_days"]
+        if grant.get("unused") is True or stale:
+            evidence = (f"O acesso {grant.get('role', 'sem função')} não é utilizado há mais de {limits['unused_days']} dias." if stale or not grant.get("totalPermissions")
+                        else f"Nenhuma das {grant['totalPermissions']} permissões de {grant.get('role')} foi exercida no período observado pelo provedor.")
+            results.append(finding("PERMISSION_USAGE", "high", "Permissão sem uso real", evidence, identity_id, str(grant.get("resourceId", ""))))
 
         review_days = days_since(grant.get("lastReviewedAt"))
         if grant.get("reviewDue") is True or (review_days is not None and review_days > limits["review_days"]):
@@ -1223,11 +1227,12 @@ def execute_scan(credential_id: int, actor: str) -> dict[str, Any]:
         for item in accesses:
             connection.execute(
                 """INSERT INTO access_grants(credential_id,identity_external_id,resource_id,resource_name,role_name,
-                   permissions_json,privileged,granted_at,last_used_at,last_reviewed_at,raw_json)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                   permissions_json,privileged,granted_at,last_used_at,last_reviewed_at,used_permissions,total_permissions,raw_json)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (credential_id, str(item["identityId"]), str(item["resourceId"]), item.get("resourceName", item["resourceId"]),
                  item["role"], json.dumps(item.get("permissions", [])), int(item.get("privileged", False)),
-                 item.get("grantedAt"), item.get("lastUsedAt"), item.get("lastReviewedAt"), json.dumps(item)),
+                 item.get("grantedAt"), item.get("lastUsedAt"), item.get("lastReviewedAt"),
+                 item.get("usedPermissions"), item.get("totalPermissions"), json.dumps(item)),
             )
         for item in projects:
             if not isinstance(item, dict) or not item.get("id"):
@@ -1259,8 +1264,9 @@ def execute_scan(credential_id: int, actor: str) -> dict[str, Any]:
             )
         finished_at = utc_now()
         connection.execute(
-            "UPDATE scans SET status='completed',identity_count=?,access_count=?,finding_count=?,telemetry_event_count=?,telemetry_status=?,risk_score=?,finished_at=? WHERE id=?",
-            (len(identities), len(accesses), len(findings), len(events), telemetry_status, risk_score_value, finished_at, scan_id),
+            "UPDATE scans SET status='completed',identity_count=?,access_count=?,finding_count=?,telemetry_event_count=?,telemetry_status=?,usage_status=?,risk_score=?,finished_at=? WHERE id=?",
+            (len(identities), len(accesses), len(findings), len(events), telemetry_status,
+             discovered.get("usageStatus", "not_collected"), risk_score_value, finished_at, scan_id),
         )
         scope = f"{len(projects)} projetos/contas · {len(identities)} identidades · {len(accesses)} acessos"
         expires_at = discovered.get("expiresAt") or row["expires_at"]
@@ -1860,46 +1866,69 @@ def list_accesses(credential_id: int | None = None, limit: int = Query(200, ge=1
                        "permissions": permissions, "privileged": bool(row["privileged"]),
                        "wildcard": row["role_name"] in WILDCARD_ROLES or any("*" in str(item) for item in permissions),
                        "grantedAt": row["granted_at"], "lastUsedAt": row["last_used_at"],
+                       "usedPermissions": row["used_permissions"], "totalPermissions": row["total_permissions"],
                        "lastReviewedAt": row["last_reviewed_at"]})
     return result
 
 
+USAGE_STATUS_LABEL = {"collected": "Telemetria de uso coletada", "partial": "Telemetria de uso parcial",
+                      "permission_denied": "Telemetria de uso recusada pelo provedor", "unavailable": "Telemetria de uso indisponível",
+                      "not_collected": "Análise anterior não coletou uso; execute uma nova análise"}
+
+
 @app.get("/api/accesses/summary")
 def accesses_summary(credential_id: int | None = None) -> dict[str, Any]:
+    clause, params = (" AND a.credential_id=?", (credential_id,)) if credential_id is not None else ("", ())
     with db() as connection:
         unused_days = load_settings(connection)["rules"]["unused_days"]
         rows = connection.execute(
-            """SELECT a.role_name,a.permissions_json,a.last_used_at,i.identity_type,c.provider FROM access_grants a
-               JOIN credentials c ON c.id=a.credential_id
-               LEFT JOIN identities i ON i.credential_id=a.credential_id AND i.external_id=a.identity_external_id"""
-            + (" WHERE a.credential_id=?" if credential_id is not None else ""), (credential_id,) if credential_id is not None else ()
-        ).fetchall()
+            f"""SELECT a.role_name,a.permissions_json,a.last_used_at,a.used_permissions,a.total_permissions,i.identity_type,c.provider
+                FROM access_grants a JOIN credentials c ON c.id=a.credential_id
+                LEFT JOIN identities i ON i.credential_id=a.credential_id AND i.external_id=a.identity_external_id WHERE 1=1{clause}""",
+            params).fetchall()
         resources = connection.execute(
-            "SELECT COUNT(*) count FROM cloud_resources" + (" WHERE credential_id=?" if credential_id is not None else ""),
-            (credential_id,) if credential_id is not None else ()).fetchone()["count"]
+            "SELECT COUNT(*) count FROM cloud_resources" + (" WHERE credential_id=?" if credential_id is not None else ""), params).fetchone()["count"]
+        statuses = connection.execute(
+            f"""SELECT c.provider,s.usage_status FROM scans s JOIN credentials c ON c.id=s.credential_id WHERE s.id IN (
+                SELECT MAX(id) FROM scans WHERE status='completed'{clause.replace('a.credential_id', 'credential_id')} GROUP BY credential_id)""",
+            params).fetchall()
+    usage_by_provider: dict[str, set[str]] = {}
+    for row in statuses:
+        usage_by_provider.setdefault(row["provider"], set()).add(row["usage_status"] or "not_collected")
     cutoff = datetime.now(timezone.utc) - timedelta(days=unused_days)
-    by_provider: dict[str, dict[str, int]] = {}
-    unused = with_usage = direct = group = wildcard = 0
+    by_provider: dict[str, dict[str, Any]] = {}
+    unused = with_usage = direct = group = wildcard = used = granted = 0
     for row in rows:
-        stats = by_provider.setdefault(row["provider"], {"total": 0, "withUsage": 0, "unused": 0})
+        stats = by_provider.setdefault(row["provider"], {"total": 0, "withUsage": 0, "unused": 0, "used": 0, "granted": 0})
         stats["total"] += 1
-        last = parse_date(row["last_used_at"]) if row["last_used_at"] else None
-        if last:
-            last = last if last.tzinfo else last.replace(tzinfo=timezone.utc)
+        last = as_utc(parse_date(row["last_used_at"])) if row["last_used_at"] else None
+        has_insight = row["total_permissions"] is not None
+        if last or has_insight:
             with_usage += 1
             stats["withUsage"] += 1
-            if last < cutoff:
+            if (last and last < cutoff) or (has_insight and row["used_permissions"] == 0):
                 unused += 1
                 stats["unused"] += 1
+        if has_insight:
+            used += row["used_permissions"] or 0
+            granted += row["total_permissions"] or 0
+            stats["used"] += row["used_permissions"] or 0
+            stats["granted"] += row["total_permissions"] or 0
         if grant_origin(row["identity_type"]) == "Grupo":
             group += 1
         else:
             direct += 1
         if row["role_name"] in WILDCARD_ROLES or "*" in (row["permissions_json"] or ""):
             wildcard += 1
+    providers = []
+    for key, value in sorted(by_provider.items()):
+        states = usage_by_provider.get(key, {"not_collected"})
+        state = "collected" if states == {"collected"} else "partial" if states & {"collected", "partial"} else sorted(states)[0]
+        providers.append({"provider": key, **value, "usageStatus": state, "usageLabel": USAGE_STATUS_LABEL.get(state, state),
+                          "usageHint": "" if state == "collected" else USAGE_HINT.get(key, "")})
     return {"total": len(rows), "resources": resources, "unusedDays": unused_days, "unused": unused, "withUsage": with_usage,
-            "direct": direct, "group": group, "wildcard": wildcard,
-            "byProvider": [{"provider": key, **value} for key, value in sorted(by_provider.items())]}
+            "usedPermissions": used, "grantedPermissions": granted, "direct": direct, "group": group, "wildcard": wildcard,
+            "byProvider": providers}
 
 
 @app.get("/api/resources")

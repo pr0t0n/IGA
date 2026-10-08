@@ -359,7 +359,8 @@ async function loadAccessView() {
   if (a.view === 'roles' && !a.roles) a.roles = await api('/inventory/roles?limit=10000');
   if (a.view === 'accounts' && !a.accounts) a.accounts = await api('/inventory/accounts?limit=10000');
 }
-function isStale(grant) { const days = grant.lastUsedAt ? (Date.now() - new Date(grant.lastUsedAt)) / 86400000 : null; return days !== null && days > state.acc.summary.unusedDays; }
+function isStale(grant) { const days = grant.lastUsedAt ? (Date.now() - new Date(grant.lastUsedAt)) / 86400000 : null; return (days !== null && days > state.acc.summary.unusedDays) || (grant.totalPermissions > 0 && grant.usedPermissions === 0); }
+function usageCell(g) { return g.totalPermissions ? `<div class="stack-6">${bar(g.usedPermissions / g.totalPermissions * 100, g.usedPermissions ? '' : 'var(--color-accent)')}<span class="muted-sm">${fmt(g.usedPermissions)} de ${fmt(g.totalPermissions)} (${pct(g.usedPermissions, g.totalPermissions)}%)</span></div>` : '<span class="muted-sm">Sem telemetria</span>'; }
 function accessMatches(text) { const query = state.acc.q.trim().toLowerCase(); return !query || text.toLowerCase().includes(query); }
 function renderAccesses() {
   const a = state.acc; const s = a.summary;
@@ -368,11 +369,13 @@ function renderAccesses() {
   setHTML('#acc-kpis', [
     stat('Concessões', fmt(s.total), `em ${fmt(state.credentials.length || new Set(a.grants.map(g => g.credentialId)).size)} ambiente(s)`),
     stat('Recursos', fmt(s.resources), 'projetos, contas, assinaturas e repositórios'),
-    stat(`Sem uso > ${s.unusedDays} dias`, fmt(s.unused), s.withUsage ? `${pct(s.unused, s.withUsage)}% das ${fmt(s.withUsage)} com telemetria de uso` : 'o provedor não informa o último uso', true),
+    stat(`Sem uso > ${s.unusedDays} dias`, fmt(s.unused), s.withUsage ? `${pct(s.unused, s.withUsage)}% das ${fmt(s.withUsage)} com telemetria de uso` : 'telemetria de uso não coletada', true),
     stat('Concessões diretas', fmt(s.direct), 'fora de grupos'),
     stat('Curingas (*)', fmt(s.wildcard), 'permissões irrestritas', true),
   ].join(''));
-  const byProvider = s.byProvider.map(p => `<div class="stack-6"><div class="fw-row-top"><span class="semibold">${escapeHtml(p.provider)}</span><span class="strong">${p.withUsage ? `${pct(p.unused, p.withUsage)}%` : '—'}</span></div>${bar(p.withUsage ? pct(p.unused, p.withUsage) : 0, 'var(--color-accent)', 'bar-8')}<div class="muted-sm">${p.withUsage ? `${fmt(p.unused)} de ${fmt(p.withUsage)} concessões com telemetria` : `${fmt(p.total)} concessões · último uso não informado pelo provedor`}</div></div>`).join('') || '<div class="empty">Nenhuma concessão coletada.</div>';
+  const byProvider = s.byProvider.map(p => p.withUsage
+    ? `<div class="stack-6"><div class="fw-row-top"><span class="semibold">${escapeHtml(p.provider)}</span><span class="strong">${pct(p.unused, p.withUsage)}%</span></div>${bar(pct(p.unused, p.withUsage), 'var(--color-accent)', 'bar-8')}<div class="muted-sm">${fmt(p.unused)} de ${fmt(p.withUsage)} concessões com telemetria${p.granted ? ` · ${pct(p.used, p.granted)}% das permissões exercidas` : ''}</div>${p.usageHint ? `<div class="note">${escapeHtml(p.usageLabel)}. ${escapeHtml(p.usageHint)}</div>` : ''}</div>`
+    : `<div class="stack-6"><div class="fw-row-top"><span class="semibold">${escapeHtml(p.provider)}</span><span class="tag tag-outline">${p.usageStatus === 'not_collected' ? 'Não coletado' : 'Sem telemetria'}</span></div><div class="muted-sm">${fmt(p.total)} concessões sem dados de uso. ${escapeHtml(p.usageLabel)}.</div>${p.usageHint ? `<div class="flag">${escapeHtml(p.usageHint)}</div>` : ''}${p.usageStatus === 'not_collected' && !isReadonly() ? '<button type="button" class="btn btn-secondary btn-sm" data-nav="credenciais">Reanalisar em Credenciais</button>' : ''}</div>`).join('') || '<div class="empty">Nenhuma concessão coletada.</div>';
   setHTML('#acc-side', `
     <div class="stack-12"><div><div class="card-kicker">Uso real</div><div class="card-title">Concessões sem uso (${s.unusedDays} dias)</div></div>${byProvider}</div>
     <div class="stack-10 divider-top"><div class="card-title">Origem das concessões</div><div class="split-bar">${s.total ? `<span class="ink" data-w="${pct(s.direct, s.total)}%"></span><span class="gray" data-w="${100 - pct(s.direct, s.total)}%"></span>` : '<span class="gray" data-w="100%"></span>'}</div><div class="split-legend"><span><b>${fmt(s.direct)}</b> diretas (${pct(s.direct, s.total)}%)</span><span><b>${fmt(s.group)}</b> via grupo (${pct(s.group, s.total)}%)</span></div><div class="note">Concessões diretas a pessoas dificultam a revisão. Prefira grupos e papéis.</div></div>
@@ -382,7 +385,7 @@ function renderAccesses() {
   if (a.view === 'grants') {
     const rows = a.grants.filter(g => providerOk(g.provider) && (!a.unused || isStale(g)) && accessMatches(`${g.identityName} ${g.identityId} ${g.resourceName} ${g.role}`));
     total = rows.length; const shown = rows.slice(0, ROW_LIMIT); shownCount = shown.length;
-    table = `<table class="table min-820"><thead><tr><th>Identidade</th><th>Recurso</th><th>Papel / permissão</th><th>Origem</th><th>Concedido</th><th>Último uso</th><th>Nível</th></tr></thead><tbody>${shown.map(g => { const stale = isStale(g); return `<tr class="${stale ? 'stale' : ''}"><td class="semibold break">${escapeHtml(g.identityName)}</td><td><div class="break">${escapeHtml(g.resourceName)}</div><div class="t-sub">${escapeHtml(g.provider)} · ${escapeHtml(g.environment)}</div></td><td class="mono break">${escapeHtml(g.role)}</td><td>${escapeHtml(g.origin)}</td><td class="muted nowrap">${g.grantedAt ? dayMonth(g.grantedAt) + '/' + new Date(g.grantedAt).getFullYear() : '—'}</td><td class="nowrap ${stale ? 'strong accent-text' : ''}">${g.lastUsedAt ? ago(g.lastUsedAt) : '<span class="muted">Sem telemetria</span>'}</td><td>${g.privileged ? '<span class="tag tag-accent">Privilegiado</span>' : '<span class="tag tag-neutral">Padrão</span>'}${g.wildcard ? ' <span class="tag tag-outline">*</span>' : ''}</td></tr>`; }).join('') || emptyRow(7, a.grants.length ? 'Nenhuma concessão corresponde aos filtros.' : 'Execute uma análise para preencher o inventário.')}</tbody></table>`;
+    table = `<table class="table min-900"><thead><tr><th>Identidade</th><th>Recurso</th><th>Papel / permissão</th><th>Origem</th><th>Concedido</th><th>Último uso</th><th>Permissões usadas</th></tr></thead><tbody>${shown.map(g => { const stale = isStale(g); return `<tr class="${stale ? 'stale' : ''}"><td class="semibold break">${escapeHtml(g.identityName)}</td><td><div class="break">${escapeHtml(g.resourceName)}</div><div class="t-sub">${escapeHtml(g.provider)} · ${escapeHtml(g.environment)}</div></td><td><div class="mono break">${escapeHtml(g.role)}</div>${g.privileged ? '<span class="tag tag-accent">Privilegiado</span>' : ''}${g.wildcard ? ' <span class="tag tag-outline">*</span>' : ''}</td><td>${escapeHtml(g.origin)}</td><td class="muted nowrap">${g.grantedAt ? dayMonth(g.grantedAt) + '/' + new Date(g.grantedAt).getFullYear() : '—'}</td><td class="nowrap ${stale ? 'strong accent-text' : ''}">${g.lastUsedAt ? ago(g.lastUsedAt) : '<span class="muted">Sem telemetria</span>'}</td><td>${usageCell(g)}</td></tr>`; }).join('') || emptyRow(7, a.grants.length ? 'Nenhuma concessão corresponde aos filtros.' : 'Execute uma análise para preencher o inventário.')}</tbody></table>`;
   } else if (a.view === 'projects') {
     const rows = (a.projects || []).filter(p => providerOk(p.provider) && accessMatches(`${p.name} ${p.resourceId} ${p.environment}`));
     total = rows.length; const shown = rows.slice(0, ROW_LIMIT); shownCount = shown.length;
@@ -796,7 +799,8 @@ $('#dash-body').addEventListener('click', event => { const card = event.target.c
 // Identidades
 $$('input[name="id-type"]').forEach(radio => radio.addEventListener('change', () => { if (radio.checked) { state.ids.type = radio.value; renderIdentities(); } }));
 $('#id-provider').addEventListener('change', event => { state.ids.provider = event.target.value; renderIdentities(); });
-$('#id-search').addEventListener('input', event => { state.ids.q = event.target.value; renderIdentities(); });
+let idSearchTimer;
+$('#id-search').addEventListener('input', event => { clearTimeout(idSearchTimer); idSearchTimer = setTimeout(() => { state.ids.q = event.target.value; renderIdentities(); }, 180); });
 $('#id-rows').addEventListener('click', event => { const row = event.target.closest('[data-identity]'); if (row) selectIdentity(Number(row.dataset.identity)); });
 $('#id-aside').addEventListener('click', event => {
   if (event.target.closest('[data-close-aside]')) { state.ids.selected = null; $('#id-aside').hidden = true; renderIdentities(); return; }
@@ -810,9 +814,10 @@ $('#id-export').addEventListener('click', () => downloadCsv('identidades-nexo-ig
 $$('input[name="acc-view"]').forEach(radio => radio.addEventListener('change', async () => { if (!radio.checked) return; state.acc.view = radio.value; try { await loadAccessView(); } catch (error) { toast(error.message); } renderAccesses(); }));
 $$('input[name="acc-prov"]').forEach(radio => radio.addEventListener('change', () => { if (radio.checked) { state.acc.prov = radio.value; renderAccesses(); } }));
 $('#acc-unused').addEventListener('change', event => { state.acc.unused = event.target.checked; renderAccesses(); });
-$('#acc-search').addEventListener('input', event => { state.acc.q = event.target.value; renderAccesses(); });
-$('#acc-export').addEventListener('click', () => { const a = state.acc; downloadCsv('acessos-nexo-iga.csv', ['Identidade', 'ID', 'Recurso', 'Provedor', 'Ambiente', 'Papel', 'Origem', 'Privilegiado', 'Concedido', 'Último uso'],
-  a.grants.filter(g => (a.prov === 'all' || g.provider === a.prov) && (!a.unused || isStale(g)) && accessMatches(`${g.identityName} ${g.identityId} ${g.resourceName} ${g.role}`)).map(g => [g.identityName, g.identityId, g.resourceName, g.provider, g.environment, g.role, g.origin, g.privileged ? 'Sim' : 'Não', g.grantedAt || '', g.lastUsedAt || 'Sem telemetria'])); });
+let accSearchTimer;
+$('#acc-search').addEventListener('input', event => { clearTimeout(accSearchTimer); accSearchTimer = setTimeout(() => { state.acc.q = event.target.value; renderAccesses(); }, 180); });
+$('#acc-export').addEventListener('click', () => { const a = state.acc; downloadCsv('acessos-nexo-iga.csv', ['Identidade', 'ID', 'Recurso', 'Provedor', 'Ambiente', 'Papel', 'Origem', 'Privilegiado', 'Concedido', 'Último uso', 'Permissões usadas', 'Permissões do papel'],
+  a.grants.filter(g => (a.prov === 'all' || g.provider === a.prov) && (!a.unused || isStale(g)) && accessMatches(`${g.identityName} ${g.identityId} ${g.resourceName} ${g.role}`)).map(g => [g.identityName, g.identityId, g.resourceName, g.provider, g.environment, g.role, g.origin, g.privileged ? 'Sim' : 'Não', g.grantedAt || '', g.lastUsedAt || 'Sem telemetria', g.usedPermissions ?? '', g.totalPermissions ?? ''])); });
 
 // Riscos
 $('#risk-sevs').addEventListener('click', event => { const button = event.target.closest('[data-risk-sev]'); if (button) { state.risk.severity = state.risk.severity === button.dataset.riskSev ? null : button.dataset.riskSev; renderRisks(); } });
