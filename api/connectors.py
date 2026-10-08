@@ -264,10 +264,14 @@ def discover_aws(credential: dict[str, Any], scopes: list[str] | None = None) ->
             arn = user["Arn"]
             tags = {tag["Key"].lower(): tag["Value"] for tag in iam.list_user_tags(UserName=username).get("Tags", [])}
             mfa = bool(iam.list_mfa_devices(UserName=username, MaxItems=1).get("MFADevices"))
+            key_dates = [key["CreateDate"] for key in iam.list_access_keys(UserName=username).get("AccessKeyMetadata", [])
+                         if key.get("Status") == "Active" and key.get("CreateDate")]
             identities.append({
                 "id": arn, "name": username, "type": "user", "enabled": True,
                 "mfaEnabled": mfa, "owner": tags.get("owner"), "lifecycleStatus": tags.get("lifecycle", "active"),
+                "lifecycleChangedAt": tags.get("lifecycle-changed-at"),
                 "lastSeenAt": iso(user.get("PasswordLastUsed")),
+                "accessKeyCreatedAt": iso(min(key_dates)) if key_dates else None,
             })
             for policy in iam.list_attached_user_policies(UserName=username).get("AttachedPolicies", []):
                 accesses.append({
@@ -614,7 +618,8 @@ def discover_gcp(credential: dict[str, Any], scopes: list[str] | None = None) ->
             labels = (entry.get("resource") or {}).get("labels") or {}
             events.append({"identityId": principal, "resourceId": labels.get("project_id") or project_id,
                            "timestamp": entry.get("timestamp"), "method": method, "callerIp": (payload.get("requestMetadata") or {}).get("callerIp"),
-                           "anomalous": anomalous, "riskScore": risk_score if anomalous else 0, "description": description})
+                           "denied": denied, "anomalous": anomalous, "riskScore": risk_score if anomalous else 0,
+                           "description": description})
     if telemetry_http_statuses and telemetry_successes == 0:
         telemetry_status = "permission_denied" if telemetry_http_statuses.intersection({401, 403}) else "unavailable"
     elif telemetry_http_statuses:

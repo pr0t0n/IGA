@@ -8,7 +8,7 @@ WORKDIR /app
 RUN addgroup -S iga && adduser -S -G iga iga
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY main.py connectors.py ./
+COPY main.py connectors.py catalog.py ./
 COPY tests ./tests
 
 RUN mkdir -p /data && chown iga:iga /data

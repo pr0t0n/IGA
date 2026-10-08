@@ -6,6 +6,8 @@ import os
 import re
 import secrets
 import sqlite3
+import threading
+import time
 import requests
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -17,6 +19,8 @@ from fastapi import FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
+from catalog import (DEFAULT_SETTINGS, FRAMEWORKS, MODULES, RULE_DETAILS, RULE_PARAMETERS, SCHEDULES, SEVERITY_ORDER,
+                     classify_event, framework_report, identity_risk, merged_settings, risk_level, risk_score)
 from connectors import REQUIREMENTS, ConnectorError, aws_expiry, describe_credential, discover, normalize_credential, probe, scope_entry
 
 DB_PATH = os.getenv("DATABASE_PATH", "/data/iga.db")
@@ -96,8 +100,39 @@ class CredentialValidation(BaseModel):
 
 
 class FindingUpdate(BaseModel):
-    status: Literal["open", "resolved", "accepted", "dismissed"]
-    justification: str = Field(min_length=3, max_length=500)
+    status: Literal["open", "resolved", "accepted", "dismissed", "remediating", "incident"]
+    justification: str | None = Field(default=None, min_length=3, max_length=500)
+
+
+class AccessRequestInput(BaseModel):
+    note: str | None = Field(default=None, max_length=500)
+
+
+class ReviewCampaignInput(BaseModel):
+    name: str = Field(min_length=3, max_length=150)
+    scope: Literal["privileged", "unused", "all", "identity"]
+    credentialId: int | None = None
+    identityId: int | None = None
+    reviewer: str = Field(min_length=2, max_length=150)
+    dueDays: int = Field(default=30, ge=1, le=365)
+
+
+class ReviewDecisionInput(BaseModel):
+    decision: Literal["keep", "revoke"]
+    comment: str | None = Field(default=None, max_length=500)
+
+
+class SettingsInput(BaseModel):
+    rules: dict[str, int]
+    schedule: Literal["manual", "daily", "6h", "hourly"]
+    notifications: dict[str, bool]
+    webhook: str = Field(default="", max_length=500)
+
+
+class InviteInput(BaseModel):
+    email: str = Field(min_length=5, max_length=200)
+    role: Literal["admin", "analyst", "auditor", "reader"]
+    name: str | None = Field(default=None, min_length=2, max_length=100)
 
 
 class LoginInput(BaseModel):
@@ -109,12 +144,12 @@ class UserInput(BaseModel):
     name: str = Field(min_length=2, max_length=100)
     email: str = Field(min_length=5, max_length=200)
     password: str = Field(min_length=8, max_length=200)
-    role: Literal["admin", "analyst", "auditor"]
+    role: Literal["admin", "analyst", "auditor", "reader"]
 
 
 class UserUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=2, max_length=100)
-    role: Literal["admin", "analyst", "auditor"] | None = None
+    role: Literal["admin", "analyst", "auditor", "reader"] | None = None
     active: bool | None = None
     password: str | None = Field(default=None, min_length=8, max_length=200)
 
@@ -149,7 +184,8 @@ def issue_token(user: dict[str, Any]) -> str:
 
 def public_user(row: Any) -> dict[str, Any]:
     return {"id": row["id"], "name": row["name"], "email": row["email"],
-            "role": row["role"], "active": bool(row["active"]), "createdAt": row["created_at"]}
+            "role": row["role"], "active": bool(row["active"]), "createdAt": row["created_at"],
+            "lastLoginAt": row["last_login_at"] if "last_login_at" in row.keys() else None}
 
 
 class DatabaseConnection:
@@ -314,7 +350,7 @@ def init_db() -> None:
             name TEXT NOT NULL,
             email TEXT NOT NULL UNIQUE,
             password_hash TEXT NOT NULL,
-            role TEXT NOT NULL CHECK(role IN ('admin','analyst','auditor')),
+            role TEXT NOT NULL CHECK(role IN ('admin','analyst','auditor','reader')),
             active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -324,28 +360,80 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_resources_credential ON cloud_resources(credential_id);
         CREATE INDEX IF NOT EXISTS idx_findings_credential ON findings(credential_id, status);
         CREATE INDEX IF NOT EXISTS idx_ai_analyses_credential ON ai_analyses(credential_id,scan_id);
+        CREATE TABLE IF NOT EXISTS telemetry_events (
+            id {serial},
+            credential_id INTEGER NOT NULL REFERENCES credentials(id) ON DELETE CASCADE,
+            scan_id INTEGER REFERENCES scans(id) ON DELETE CASCADE,
+            identity_external_id TEXT,
+            resource_id TEXT,
+            occurred_at TEXT,
+            method TEXT,
+            caller_ip TEXT,
+            denied INTEGER NOT NULL DEFAULT 0,
+            anomalous INTEGER NOT NULL DEFAULT 0,
+            risk_score REAL NOT NULL DEFAULT 0,
+            description TEXT,
+            source TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_telemetry_credential ON telemetry_events(credential_id,occurred_at);
+        CREATE TABLE IF NOT EXISTS review_campaigns (
+            id {serial},
+            name TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            credential_id INTEGER REFERENCES credentials(id) ON DELETE SET NULL,
+            reviewer TEXT NOT NULL,
+            due_at TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            completed_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS review_items (
+            id {serial},
+            campaign_id INTEGER NOT NULL REFERENCES review_campaigns(id) ON DELETE CASCADE,
+            credential_id INTEGER NOT NULL,
+            identity_external_id TEXT NOT NULL,
+            identity_name TEXT NOT NULL,
+            resource_id TEXT NOT NULL,
+            resource_name TEXT NOT NULL,
+            role_name TEXT NOT NULL,
+            privileged INTEGER NOT NULL DEFAULT 0,
+            decision TEXT,
+            comment TEXT,
+            decided_by TEXT,
+            decided_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_review_items_campaign ON review_items(campaign_id);
+        CREATE TABLE IF NOT EXISTS access_requests (
+            id {serial},
+            credential_id INTEGER NOT NULL REFERENCES credentials(id) ON DELETE CASCADE,
+            identity_external_id TEXT NOT NULL,
+            resource_id TEXT NOT NULL,
+            role_name TEXT NOT NULL,
+            action TEXT NOT NULL,
+            status TEXT NOT NULL,
+            note TEXT,
+            requested_by TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS platform_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         """)
+        ensure_columns(connection, "scans", {"risk_score": "INTEGER", "telemetry_event_count": "INTEGER NOT NULL DEFAULT 0",
+                                             "telemetry_status": "TEXT NOT NULL DEFAULT 'not_collected'"})
+        ensure_columns(connection, "credentials", {column: "TEXT" for column in (
+            "last_synced_at", "auth_kind", "principal", "scopes_json", "last_error", "expires_at")})
+        ensure_columns(connection, "audit_events", {column: "TEXT" for column in (
+            "action", "target", "result", "source", "details_json", "record_hash")})
+        ensure_columns(connection, "platform_users", {"last_login_at": "TEXT"})
+        ensure_columns(connection, "findings", {"updated_at": "TEXT"})
         if connection.postgres:
-            scan_columns = {row["column_name"] for row in connection.execute(
-                "SELECT column_name FROM information_schema.columns WHERE table_name='scans'"
-            ).fetchall()}
-        else:
-            scan_columns = {row["name"] for row in connection.execute("PRAGMA table_info(scans)").fetchall()}
-        if "risk_score" not in scan_columns:
-            connection.execute("ALTER TABLE scans ADD COLUMN risk_score INTEGER")
-        if "telemetry_event_count" not in scan_columns:
-            connection.execute("ALTER TABLE scans ADD COLUMN telemetry_event_count INTEGER NOT NULL DEFAULT 0")
-        if "telemetry_status" not in scan_columns:
-            connection.execute("ALTER TABLE scans ADD COLUMN telemetry_status TEXT NOT NULL DEFAULT 'not_collected'")
-        if connection.postgres:
-            credential_columns = {row["column_name"] for row in connection.execute(
-                "SELECT column_name FROM information_schema.columns WHERE table_name='credentials'"
-            ).fetchall()}
-        else:
-            credential_columns = {row["name"] for row in connection.execute("PRAGMA table_info(credentials)").fetchall()}
-        for column in ("last_synced_at", "auth_kind", "principal", "scopes_json", "last_error", "expires_at"):
-            if column not in credential_columns:
-                connection.execute(f"ALTER TABLE credentials ADD COLUMN {column} TEXT")
+            connection.execute("ALTER TABLE platform_users DROP CONSTRAINT IF EXISTS platform_users_role_check")
+            connection.execute("ALTER TABLE platform_users ADD CONSTRAINT platform_users_role_check "
+                               "CHECK(role IN ('admin','analyst','auditor','reader'))")
+        backfill_audit_chain(connection)
         for legacy in connection.execute(
             "SELECT id,provider,encrypted_payload FROM credentials WHERE principal IS NULL OR principal=''"
         ).fetchall():
@@ -363,9 +451,22 @@ def init_db() -> None:
             )
 
 
+def ensure_columns(connection: DatabaseConnection, table: str, columns: dict[str, str]) -> None:
+    if connection.postgres:
+        existing = {row["column_name"] for row in connection.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name=?", (table,)
+        ).fetchall()}
+    else:
+        existing = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+    for column, definition in columns.items():
+        if column not in existing:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 @app.on_event("startup")
 def startup() -> None:
     init_db()
+    start_scheduler()
 
 
 @app.middleware("http")
@@ -387,9 +488,12 @@ async def authentication_middleware(request: Request, call_next):
     except Exception:
         return JSONResponse({"detail": "Sessão inválida ou expirada"}, status_code=401)
     role = request.state.user["role"]
-    if role == "auditor" and request.method not in {"GET", "HEAD", "OPTIONS"}:
-        return JSONResponse({"detail": "Perfil Auditor possui acesso somente leitura"}, status_code=403)
-    if path.startswith("/api/users") and role != "admin":
+    if role in {"auditor", "reader"} and request.method not in {"GET", "HEAD", "OPTIONS"}:
+        label = "Auditor" if role == "auditor" else "Leitor"
+        return JSONResponse({"detail": f"Perfil {label} possui acesso somente leitura"}, status_code=403)
+    if role == "reader" and path.startswith("/api/audit"):
+        return JSONResponse({"detail": "Perfil Leitor não acessa a trilha de auditoria"}, status_code=403)
+    if (path.startswith("/api/users") or (path.startswith("/api/settings") and request.method != "GET")) and role != "admin":
         return JSONResponse({"detail": "Operação exclusiva para administradores"}, status_code=403)
     return await call_next(request)
 
@@ -400,6 +504,8 @@ def login(payload: LoginInput) -> dict[str, Any]:
         user = connection.execute("SELECT * FROM platform_users WHERE email=? AND active=1", (payload.email.strip().lower(),)).fetchone()
         if not user or not verify_password(payload.password, user["password_hash"]):
             raise HTTPException(401, "E-mail ou senha inválidos")
+        connection.execute("UPDATE platform_users SET last_login_at=? WHERE id=?", (utc_now(), user["id"]))
+        user = connection.execute("SELECT * FROM platform_users WHERE id=?", (user["id"],)).fetchone()
     visible = public_user(user)
     return {"token": issue_token(visible), "user": visible}
 
@@ -431,6 +537,27 @@ def create_user(payload: UserInput, request: Request) -> dict[str, Any]:
         audit(connection, "admin", "Usuário criado", f"{email} recebeu o perfil {payload.role}.", request.state.user["email"])
         row = connection.execute("SELECT * FROM platform_users WHERE id=?", (user_id,)).fetchone()
     return public_user(row)
+
+
+@app.post("/api/users/invite", status_code=status.HTTP_201_CREATED)
+def invite_user(payload: InviteInput, request: Request) -> dict[str, Any]:
+    email = payload.email.strip().lower()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise HTTPException(422, "Informe um e-mail válido")
+    temporary = secrets.token_urlsafe(12)
+    name = payload.name.strip() if payload.name else email.split("@")[0]
+    now = utc_now()
+    with db() as connection:
+        if connection.execute("SELECT id FROM platform_users WHERE email=?", (email,)).fetchone():
+            raise HTTPException(409, "Já existe um usuário com este e-mail")
+        cursor = connection.execute(
+            "INSERT INTO platform_users(name,email,password_hash,role,active,created_at,updated_at) VALUES(?,?,?,?,?,?,?) RETURNING id",
+            (name, email, hash_password(temporary), payload.role, 1, now, now))
+        user_id = cursor.fetchone()["id"]
+        audit(connection, "admin", "Usuário convidado", f"{email} recebeu o perfil {payload.role} com senha temporária.",
+              request.state.user["email"], action="user.invited", target=email, details={"role": payload.role})
+        row = connection.execute("SELECT * FROM platform_users WHERE id=?", (user_id,)).fetchone()
+    return {"user": public_user(row), "temporaryPassword": temporary}
 
 
 @app.patch("/api/users/{user_id}")
@@ -532,12 +659,48 @@ def single_credential_view(connection: DatabaseConnection, credential_id: int) -
     return credential_view(row, discovered_scopes(connection, credential_id).get(credential_id))
 
 
+def audit_record_hash(previous: str | None, record: dict[str, Any]) -> str:
+    canonical = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(f"{previous or ''}{canonical}".encode()).hexdigest()
+
+
+def audit_payload(event_type: str, title: str, description: str, actor: str, created_at: str,
+                  action: str | None, target: str | None, result: str, details: dict[str, Any] | None) -> dict[str, Any]:
+    return {"type": event_type, "title": title, "description": description, "actor": actor, "createdAt": created_at,
+            "action": action, "target": target, "result": result, "details": details or {}}
+
+
 def audit(connection: DatabaseConnection, event_type: str, title: str, description: str,
-          actor: str = "Administrador local") -> None:
+          actor: str = "Administrador local", *, action: str | None = None, target: str | None = None,
+          result: str = "Sucesso", details: dict[str, Any] | None = None) -> None:
+    """Append-only trail: every record hashes the previous one (SHA-256 chain)."""
+    created_at = utc_now()
+    previous = connection.execute("SELECT record_hash FROM audit_events ORDER BY id DESC LIMIT 1").fetchone()
+    record = audit_payload(event_type, title, description, actor, created_at, action, target, result, details)
     connection.execute(
-        "INSERT INTO audit_events(event_type,title,description,actor,created_at) VALUES(?,?,?,?,?)",
-        (event_type, title, description, actor, utc_now()),
+        """INSERT INTO audit_events(event_type,title,description,actor,created_at,action,target,result,source,details_json,record_hash)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+        (event_type, title, description, actor, created_at, action, target, result, "Plataforma",
+         json.dumps(details or {}, ensure_ascii=False), audit_record_hash(previous["record_hash"] if previous else None, record)),
     )
+
+
+def backfill_audit_chain(connection: DatabaseConnection) -> None:
+    pending = connection.execute("SELECT id FROM audit_events WHERE record_hash IS NULL ORDER BY id LIMIT 1").fetchone()
+    if not pending:
+        return
+    previous = connection.execute(
+        "SELECT record_hash FROM audit_events WHERE id<? ORDER BY id DESC LIMIT 1", (pending["id"],)
+    ).fetchone()
+    previous_hash = previous["record_hash"] if previous else None
+    for row in connection.execute("SELECT * FROM audit_events WHERE id>=? ORDER BY id", (pending["id"],)).fetchall():
+        result = row["result"] or ("Falha" if "Falha" in row["title"] else "Sucesso")
+        details = json.loads(row["details_json"]) if row["details_json"] else {}
+        record = audit_payload(row["event_type"], row["title"], row["description"], row["actor"], row["created_at"],
+                               row["action"], row["target"], result, details)
+        previous_hash = audit_record_hash(previous_hash, record)
+        connection.execute("UPDATE audit_events SET result=?,source=?,details_json=?,record_hash=? WHERE id=?",
+                           (result, row["source"] or "Plataforma", json.dumps(details, ensure_ascii=False), previous_hash, row["id"]))
 
 
 def parse_date(value: Any) -> datetime | None:
@@ -571,8 +734,37 @@ def calculate_risk_score(findings: list[dict[str, Any]], assessed_objects: int =
     return max(0, 100 - min(100, penalty))
 
 
+def load_settings(connection: DatabaseConnection) -> dict[str, Any]:
+    row = connection.execute("SELECT value FROM platform_settings WHERE key='platform'").fetchone()
+    return merged_settings(json.loads(row["value"]) if row else None)
+
+
+def store_settings(connection: DatabaseConnection, settings: dict[str, Any]) -> None:
+    connection.execute(
+        """INSERT INTO platform_settings(key,value,updated_at) VALUES('platform',?,?)
+           ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at""",
+        (json.dumps(settings, ensure_ascii=False), utc_now()),
+    )
+
+
+def as_utc(value: datetime | None) -> datetime:
+    if value is None:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def hours_since(value: Any) -> float | None:
+    parsed = parse_date(value)
+    if not parsed:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - parsed).total_seconds() / 3600
+
+
 def evaluate_rules(identities: list[dict[str, Any]], accesses: list[dict[str, Any]],
-                   events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+                   events: list[dict[str, Any]], rules: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    limits = {**DEFAULT_SETTINGS["rules"], **(rules or {})}
     results: list[dict[str, Any]] = []
     identities_by_id = {str(item.get("id")): item for item in identities}
     grants_by_identity: dict[str, list[dict[str, Any]]] = {}
@@ -581,12 +773,12 @@ def evaluate_rules(identities: list[dict[str, Any]], accesses: list[dict[str, An
         grants_by_identity.setdefault(identity_id, []).append(grant)
 
         unused_days = days_since(grant.get("lastUsedAt"))
-        if grant.get("unused") is True or (unused_days is not None and unused_days > 90):
+        if grant.get("unused") is True or (unused_days is not None and unused_days > limits["unused_days"]):
             results.append(finding("PERMISSION_USAGE", "high", "Permissão sem uso real",
-                f"O acesso {grant.get('role', 'sem função')} não é utilizado há mais de 90 dias.", identity_id, str(grant.get("resourceId", ""))))
+                f"O acesso {grant.get('role', 'sem função')} não é utilizado há mais de {limits['unused_days']} dias.", identity_id, str(grant.get("resourceId", ""))))
 
         review_days = days_since(grant.get("lastReviewedAt"))
-        if grant.get("reviewDue") is True or (review_days is not None and review_days > 90):
+        if grant.get("reviewDue") is True or (review_days is not None and review_days > limits["review_days"]):
             results.append(finding("ACCESS_REVIEW", "medium", "Revisão de acesso pendente",
                 "O acesso precisa ser recertificado pelo responsável.", identity_id, str(grant.get("resourceId", ""))))
 
@@ -603,18 +795,30 @@ def evaluate_rules(identities: list[dict[str, Any]], accesses: list[dict[str, An
 
     for identity_id, identity in identities_by_id.items():
         grants = grants_by_identity.get(identity_id, [])
-        if identity.get("orphan") is True:
+        orphan_days = days_since(identity.get("orphanSince"))
+        if identity.get("orphan") is True and (orphan_days is None or orphan_days >= limits["orphan_days"]):
             results.append(finding("ORPHAN_ACCOUNT", "high", "Conta sem responsável",
                 "A identidade não possui proprietário válido.", identity_id))
         if identity.get("mfaEnabled") is False and identity.get("enabled", True):
             results.append(finding("AUTHENTICATION_POSTURE", "high", "MFA não configurado",
                 "A identidade ativa não possui autenticação multifator.", identity_id))
-        if identity.get("lifecycleStatus") in {"mover", "leaver"} and grants:
-            results.append(finding("JML", "critical" if identity.get("lifecycleStatus") == "leaver" else "high",
-                "Acesso incompatível com ciclo de vida", f"Identidade em estado {identity.get('lifecycleStatus')} mantém {len(grants)} acesso(s).", identity_id))
-        if any(grant.get("accessCreep") is True for grant in grants):
-            results.append(finding("ACCESS_CREEP", "high", "Acúmulo progressivo de acessos",
-                "A fonte de telemetria marcou crescimento indevido de privilégios.", identity_id))
+        key_age = days_since(identity.get("accessKeyCreatedAt"))
+        if key_age is not None and key_age > limits["key_age_days"] and identity.get("enabled", True):
+            results.append(finding("AUTHENTICATION_POSTURE", "high", "Chave de acesso antiga",
+                f"A chave de acesso ativa tem {key_age} dias (limite: {limits['key_age_days']}).", identity_id))
+        lifecycle = identity.get("lifecycleStatus")
+        changed_hours = hours_since(identity.get("lifecycleChangedAt"))
+        if lifecycle == "leaver" and grants and (changed_hours is None or changed_hours > limits["leaver_hours"]):
+            results.append(finding("JML", "critical", "Acesso incompatível com ciclo de vida",
+                f"Identidade desligada mantém {len(grants)} acesso(s).", identity_id))
+        if lifecycle == "mover" and grants:
+            results.append(finding("JML", "high", "Acesso incompatível com ciclo de vida",
+                f"Identidade em movimentação mantém {len(grants)} acesso(s).", identity_id))
+        mover_creep = lifecycle == "mover" and changed_hours is not None and changed_hours / 24 > limits["creep_days"]
+        if mover_creep or any(grant.get("accessCreep") is True for grant in grants):
+            evidence = (f"Em movimentação há mais de {limits['creep_days']} dias mantendo {len(grants)} concessão(ões) anteriores."
+                        if mover_creep else "A fonte de telemetria marcou crescimento indevido de privilégios.")
+            results.append(finding("ACCESS_CREEP", "high", "Acúmulo progressivo de acessos", evidence, identity_id))
 
         roles = {str(grant.get("role", "")) for grant in grants}
         administrative_roles = {"roles/owner", "roles/editor", "roles/iam.securityAdmin", "roles/resourcemanager.projectIamAdmin"}
@@ -643,7 +847,7 @@ def evaluate_rules(identities: list[dict[str, Any]], accesses: list[dict[str, An
     anomaly_groups: dict[tuple[str, str, str], dict[str, Any]] = {}
     for event in events:
         score = float(event.get("riskScore", 0))
-        if event.get("anomalous") is not True and score < 0.8:
+        if score * 100 < limits["ueba_threshold"]:
             continue
         identity_id = str(event.get("identityId", ""))
         resource_id = str(event.get("resourceId", ""))
@@ -797,12 +1001,52 @@ def delete_credential(credential_id: int, request: Request) -> Response:
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+def audit_view(row: Any) -> dict[str, Any]:
+    return {"id": row["id"], "type": row["event_type"], "title": row["title"], "text": row["description"],
+            "actor": row["actor"], "createdAt": row["created_at"], "action": row["action"] or row["title"],
+            "target": row["target"] or "", "result": row["result"] or "Sucesso", "source": row["source"] or "Plataforma",
+            "details": json.loads(row["details_json"]) if row["details_json"] else {}, "hash": row["record_hash"]}
+
+
 @app.get("/api/audit")
 def list_audit() -> list[dict[str, Any]]:
     with db() as connection:
         rows = connection.execute("SELECT * FROM audit_events ORDER BY id DESC LIMIT 200").fetchall()
-    return [{"id": row["id"], "type": row["event_type"], "title": row["title"],
-             "text": row["description"], "actor": row["actor"], "createdAt": row["created_at"]} for row in rows]
+    return [audit_view(row) for row in rows]
+
+
+@app.get("/api/audit/trail")
+def audit_trail(limit: int = Query(1000, ge=1, le=5000)) -> dict[str, Any]:
+    """Platform events (hash-chained) merged with provider audit logs collected by the connectors."""
+    day_ago = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    with db() as connection:
+        platform = connection.execute("SELECT * FROM audit_events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        provider = connection.execute(
+            """SELECT t.*,c.name environment FROM telemetry_events t JOIN credentials c ON c.id=t.credential_id
+               ORDER BY t.occurred_at DESC LIMIT ?""", (limit,)).fetchall()
+        counts = {row["source"]: row["count"] for row in connection.execute(
+            "SELECT source,COUNT(*) count FROM telemetry_events WHERE occurred_at>=? GROUP BY source", (day_ago,)).fetchall()}
+        counts["Plataforma"] = connection.execute(
+            "SELECT COUNT(*) count FROM audit_events WHERE created_at>=?", (day_ago,)).fetchone()["count"]
+        collected = {row["provider"] for row in connection.execute(
+            """SELECT DISTINCT c.provider FROM scans s JOIN credentials c ON c.id=s.credential_id
+               WHERE s.status='completed' AND s.telemetry_status IN ('collected','partial')""").fetchall()}
+    events = [{"key": f"A-{row['id']}", **audit_view(row)} for row in platform]
+    for row in provider:
+        details = {"environment": row["environment"], "callerIp": row["caller_ip"], "anomalous": bool(row["anomalous"]),
+                   "riskScore": row["risk_score"], "description": row["description"]}
+        record = {"timestamp": row["occurred_at"], "actor": row["identity_external_id"], "action": row["method"],
+                  "target": row["resource_id"], "source": row["source"], "details": details}
+        events.append({"key": f"T-{row['id']}", "id": row["id"], "type": "provider", "title": row["method"] or "Evento do provedor",
+                       "text": row["description"] or "", "actor": row["identity_external_id"] or "—", "createdAt": row["occurred_at"],
+                       "action": row["method"] or "—", "target": row["resource_id"] or "", "result": "Falha" if row["denied"] else "Sucesso",
+                       "source": row["source"], "details": details,
+                       "hash": hashlib.sha256(json.dumps(record, sort_keys=True, ensure_ascii=False).encode()).hexdigest()})
+    events.sort(key=lambda item: item["createdAt"] or "", reverse=True)
+    provider_sources = {"GCP": "GCP Audit Logs", "AWS": "AWS CloudTrail", "Azure": "Azure Activity Log"}
+    sources = [{"name": "Plataforma", "count": counts.get("Plataforma", 0), "collected": True}]
+    sources += [{"name": label, "count": counts.get(label, 0), "collected": name in collected} for name, label in provider_sources.items()]
+    return {"events": events[:limit], "sources": sources}
 
 
 @app.get("/api/overview")
@@ -867,13 +1111,58 @@ def dashboard(credential_id: int | None = None) -> dict[str, Any]:
     }
 
 
-@app.post("/api/credentials/{credential_id}/scan")
-def scan_credential(credential_id: int, request: Request) -> dict[str, Any]:
+TELEMETRY_SOURCE = {"GCP": "GCP Audit Logs", "AWS": "AWS CloudTrail", "Azure": "Azure Activity Log"}
+CARRIED_STATUSES = ("accepted", "remediating", "incident", "dismissed")
+SCANS_GUARD = threading.Lock()
+RUNNING_SCANS: set[int] = set()
+
+
+class ScanError(Exception):
+    """Connector failure already recorded on the credential and in the audit trail."""
+
+
+def finding_key(rule: Any, identity_id: Any, resource_id: Any, title: Any) -> tuple[str, str, str, str]:
+    return (str(rule), str(identity_id or ""), str(resource_id or ""), str(title))
+
+
+def notify(kind: str, text: str, settings: dict[str, Any] | None = None) -> bool:
+    """Post a Slack/Teams-compatible message to the configured webhook when the notification kind is enabled."""
+    if settings is None:
+        with db() as connection:
+            settings = load_settings(connection)
+    webhook = settings.get("webhook") or ""
+    if not webhook or not settings["notifications"].get(kind):
+        return False
+    try:
+        response = requests.post(webhook, json={"text": f"[Nexo IGA] {text}"}, timeout=10)
+        response.raise_for_status()
+        return True
+    except requests.RequestException as exc:
+        with db() as connection:
+            audit(connection, "admin", "Falha ao enviar notificação", f"{kind}: {type(exc).__name__}", "notificações",
+                  action="notification.failed", target=kind, result="Falha")
+        return False
+
+
+def run_scan(credential_id: int, actor: str) -> dict[str, Any]:
+    with SCANS_GUARD:
+        if credential_id in RUNNING_SCANS:
+            raise HTTPException(409, "Já existe uma análise em andamento para esta credencial.")
+        RUNNING_SCANS.add(credential_id)
+    try:
+        return execute_scan(credential_id, actor)
+    finally:
+        with SCANS_GUARD:
+            RUNNING_SCANS.discard(credential_id)
+
+
+def execute_scan(credential_id: int, actor: str) -> dict[str, Any]:
     started_at = utc_now()
     with db() as connection:
         row = connection.execute("SELECT * FROM credentials WHERE id=?", (credential_id,)).fetchone()
         if not row:
             raise HTTPException(404, "Credencial não encontrada")
+        settings = load_settings(connection)
         credential = decrypt_credential(row)
         selected_scopes = [item["id"] for item in json.loads(row["scopes_json"])] if row["scopes_json"] else None
         try:
@@ -883,23 +1172,46 @@ def scan_credential(credential_id: int, request: Request) -> dict[str, Any]:
                 "UPDATE credentials SET status=?,last_error=?,updated_at=? WHERE id=?",
                 ("Erro", str(exc), utc_now(), credential_id),
             )
-            audit(connection, "credential", "Falha na análise cloud", f"{row['name']}: {exc}", request.state.user["email"])
+            audit(connection, "credential", "Falha na análise cloud", f"{row['name']}: {exc}", actor,
+                  action="analysis.failed", target=row["name"], result="Falha", details={"error": str(exc), "provider": row["provider"]})
             connection.commit()
-            raise HTTPException(502, str(exc)) from exc
+            failure = ScanError(str(exc))
+            failure.credential_name = row["name"]
+            failure.settings = settings
+            raise failure from exc
         identities, accesses, events = normalize_discovery(discovered)
+        reviewed = {}
+        for item in connection.execute(
+            """SELECT identity_external_id,resource_id,role_name,MAX(decided_at) decided_at FROM review_items
+               WHERE credential_id=? AND decision='keep' GROUP BY identity_external_id,resource_id,role_name""", (credential_id,)
+        ).fetchall():
+            reviewed[(item["identity_external_id"], item["resource_id"], item["role_name"])] = item["decided_at"]
+        for item in accesses:
+            decided = reviewed.get((str(item["identityId"]), str(item["resourceId"]), str(item["role"])))
+            if decided and (not item.get("lastReviewedAt") or decided > str(item["lastReviewedAt"])):
+                item["lastReviewedAt"] = decided
         telemetry_status = discovered.get("telemetryStatus", "collected" if events else "not_collected")
         projects = discovered.get("projects", [])
-        findings = evaluate_rules(identities, accesses, events)
-        risk_score = calculate_risk_score(findings, len(identities) + len(accesses))
+        findings = evaluate_rules(identities, accesses, events, settings["rules"])
+        risk_score_value = calculate_risk_score(findings, len(identities) + len(accesses))
         cursor = connection.execute(
             "INSERT INTO scans(credential_id,provider,status,started_at) VALUES(?,?,?,?) RETURNING id",
             (credential_id, row["provider"], "running", started_at),
         )
         scan_id = cursor.fetchone()["id"]
+        current = connection.execute(
+            "SELECT rule_code,identity_external_id,resource_id,title,status,severity FROM findings WHERE credential_id=? AND status NOT IN ('superseded','resolved')",
+            (credential_id,),
+        ).fetchall()
+        carried = {finding_key(item["rule_code"], item["identity_external_id"], item["resource_id"], item["title"]): item["status"]
+                   for item in current if item["status"] in CARRIED_STATUSES}
+        previous_critical = {finding_key(item["rule_code"], item["identity_external_id"], item["resource_id"], item["title"])
+                             for item in current if item["severity"] == "critical"}
         connection.execute("DELETE FROM identities WHERE credential_id=?", (credential_id,))
         connection.execute("DELETE FROM access_grants WHERE credential_id=?", (credential_id,))
         connection.execute("DELETE FROM cloud_resources WHERE credential_id=?", (credential_id,))
-        connection.execute("UPDATE findings SET status='superseded' WHERE credential_id=? AND status='open'", (credential_id,))
+        connection.execute("DELETE FROM telemetry_events WHERE credential_id=?", (credential_id,))
+        connection.execute("UPDATE findings SET status='superseded' WHERE credential_id=? AND status NOT IN ('superseded','resolved')", (credential_id,))
         for item in identities:
             connection.execute(
                 """INSERT INTO identities(credential_id,external_id,display_name,identity_type,email,enabled,
@@ -924,46 +1236,406 @@ def scan_credential(credential_id: int, request: Request) -> dict[str, Any]:
                 "INSERT INTO cloud_resources(credential_id,external_id,display_name,resource_type,raw_json) VALUES(?,?,?,?,?)",
                 (credential_id, str(item["id"]), item.get("name", str(item["id"])), item.get("type", "project"), json.dumps(item)),
             )
+        source = TELEMETRY_SOURCE.get(row["provider"], row["provider"])
+        for event in events:
+            connection.execute(
+                """INSERT INTO telemetry_events(credential_id,scan_id,identity_external_id,resource_id,occurred_at,method,
+                   caller_ip,denied,anomalous,risk_score,description,source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (credential_id, scan_id, str(event.get("identityId") or ""), str(event.get("resourceId") or ""),
+                 event.get("timestamp"), event.get("method"), event.get("callerIp"), int(bool(event.get("denied"))),
+                 int(bool(event.get("anomalous"))), float(event.get("riskScore") or 0), event.get("description"), source),
+            )
+        now = utc_now()
+        new_critical = []
         for item in findings:
+            key = finding_key(item["rule"], item["identityId"], item["resourceId"], item["title"])
+            if item["severity"] == "critical" and key not in previous_critical:
+                new_critical.append(item)
             connection.execute(
                 """INSERT INTO findings(credential_id,scan_id,rule_code,severity,title,description,
-                   identity_external_id,resource_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)""",
+                   identity_external_id,resource_id,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                 (credential_id, scan_id, item["rule"], item["severity"], item["title"], item["description"],
-                 item["identityId"], item["resourceId"], utc_now()),
+                 item["identityId"], item["resourceId"], carried.get(key, "open"), now, now),
             )
         finished_at = utc_now()
         connection.execute(
             "UPDATE scans SET status='completed',identity_count=?,access_count=?,finding_count=?,telemetry_event_count=?,telemetry_status=?,risk_score=?,finished_at=? WHERE id=?",
-            (len(identities), len(accesses), len(findings), len(events), telemetry_status, risk_score, finished_at, scan_id),
+            (len(identities), len(accesses), len(findings), len(events), telemetry_status, risk_score_value, finished_at, scan_id),
         )
         scope = f"{len(projects)} projetos/contas · {len(identities)} identidades · {len(accesses)} acessos"
+        expires_at = discovered.get("expiresAt") or row["expires_at"]
         connection.execute(
             """UPDATE credentials SET scope=?,status=?,last_error=NULL,expires_at=?,principal=COALESCE(?,principal),
                last_synced_at=?,updated_at=? WHERE id=?""",
-            (scope, "Conectado", discovered.get("expiresAt") or row["expires_at"], discovered.get("principal"),
-             finished_at, finished_at, credential_id),
+            (scope, "Conectado", expires_at, discovered.get("principal"), finished_at, finished_at, credential_id),
         )
         audit(connection, "risk", "Análise de acesso concluída",
-              f"{row['name']}: {len(identities)} identidades, {len(accesses)} acessos e {len(findings)} riscos.", request.state.user["email"])
+              f"{row['name']}: {len(identities)} identidades, {len(accesses)} acessos e {len(findings)} riscos.", actor,
+              action="analysis.completed", target=row["name"],
+              details={"identities": len(identities), "grants": len(accesses), "risks": len(findings),
+                       "telemetryEvents": len(events), "riskScore": risk_score_value})
+    ueba_alerts = [item for item in findings if item["rule"] == "UEBA_ANOMALY"]
+    if new_critical:
+        notify("critical", f"{len(new_critical)} novo(s) risco(s) crítico(s) em {row['name']}: "
+               + "; ".join(item["title"] for item in new_critical[:5]), settings)
+    if ueba_alerts:
+        notify("ueba", f"{len(ueba_alerts)} anomalia(s) UEBA acima de {settings['rules']['ueba_threshold']} pts em {row['name']}.", settings)
+    expiry = parse_date(expires_at) if expires_at else None
+    if expiry and (expiry - datetime.now(timezone.utc)).days <= 7:
+        notify("credential", f"A credencial {row['name']} expira em {max(0, (expiry - datetime.now(timezone.utc)).days)} dia(s).", settings)
     ai_analysis = generate_platform_analysis(
         credential_id, scan_id, row["name"], row["provider"], identities, accesses, findings, projects
     )
     return {"scanId": scan_id, "status": "completed", "provider": row["provider"], "source": "live",
             "identities": len(identities), "accesses": len(accesses), "findings": len(findings),
-            "riskScore": risk_score, "finishedAt": finished_at,
-            "ueba": {"eventsEvaluated": len(events), "status": telemetry_status,
-                     "anomalies": sum(1 for item in findings if item["rule"] == "UEBA_ANOMALY")},
+            "riskScore": risk_score_value, "finishedAt": finished_at,
+            "ueba": {"eventsEvaluated": len(events), "status": telemetry_status, "anomalies": len(ueba_alerts)},
             "aiAnalysis": {"id": ai_analysis["id"], "engine": ai_analysis["engine"], "priority": ai_analysis["priority"]}}
+
+
+@app.post("/api/credentials/{credential_id}/scan")
+def scan_credential(credential_id: int, request: Request) -> dict[str, Any]:
+    try:
+        return run_scan(credential_id, request.state.user["email"])
+    except ScanError as exc:
+        notify("credential", f"Falha na análise de {exc.credential_name}: {exc}", exc.settings)
+        raise HTTPException(502, str(exc)) from exc
+
+
+def next_scheduled_run(settings: dict[str, Any], credentials: list[Any]) -> str | None:
+    interval = SCHEDULES.get(settings["schedule"])
+    if not interval or not credentials:
+        return None
+    now = datetime.now(timezone.utc)
+    candidates = []
+    for item in credentials:
+        last = parse_date(item["last_synced_at"]) if item["last_synced_at"] else None
+        candidates.append(now if last is None else max(now, last + timedelta(seconds=interval)))
+    return min(candidates).isoformat()
+
+
+def scheduler_tick() -> None:
+    with db() as connection:
+        settings = load_settings(connection)
+        credentials = connection.execute("SELECT id,name,last_synced_at FROM credentials ORDER BY id").fetchall()
+        weekly = connection.execute("SELECT value FROM platform_settings WHERE key='weekly'").fetchone()
+    interval = SCHEDULES.get(settings["schedule"])
+    now = datetime.now(timezone.utc)
+    if interval:
+        for item in credentials:
+            last = parse_date(item["last_synced_at"]) if item["last_synced_at"] else None
+            if last is not None and (now - last).total_seconds() < interval:
+                continue
+            try:
+                run_scan(item["id"], "agendador")
+            except ScanError as exc:
+                notify("credential", f"Falha na análise agendada de {exc.credential_name}: {exc}", exc.settings)
+            except HTTPException:
+                continue
+    last_weekly = parse_date(json.loads(weekly["value"]).get("sentAt")) if weekly else None
+    if settings["notifications"].get("weekly") and settings["webhook"] and (last_weekly is None or (now - last_weekly).days >= 7):
+        overview = dashboard_overview(None, None, 7)
+        sent = notify("weekly", f"Resumo semanal: nota de risco {overview['score']}/100, {overview['total']} riscos ativos "
+                      f"({overview['severities']['critical']} críticos), {overview['newRisks']} novos em 7 dias.", settings)
+        if sent:
+            with db() as connection:
+                connection.execute(
+                    """INSERT INTO platform_settings(key,value,updated_at) VALUES('weekly',?,?)
+                       ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at""",
+                    (json.dumps({"sentAt": now.isoformat()}), now.isoformat()),
+                )
+
+
+SCHEDULER_STARTED = threading.Event()
+
+
+def start_scheduler() -> None:
+    if os.getenv("SCHEDULER_ENABLED", "1") == "0" or SCHEDULER_STARTED.is_set():
+        return
+    SCHEDULER_STARTED.set()
+
+    def loop() -> None:
+        while True:
+            time.sleep(60)
+            try:
+                scheduler_tick()
+            except Exception as exc:  # the scheduler must survive transient database or provider failures
+                print(f"scheduler: {type(exc).__name__}: {exc}", flush=True)
+
+    threading.Thread(target=loop, name="nexo-scheduler", daemon=True).start()
+
+
+def placeholders(values: list[Any]) -> str:
+    return ",".join("?" for _ in values) or "NULL"
+
+
+def scoped_credentials(connection: DatabaseConnection, credential_id: int | None, provider: str | None) -> list[Any]:
+    rows = connection.execute("SELECT * FROM credentials ORDER BY name").fetchall()
+    return [row for row in rows if (credential_id is None or row["id"] == credential_id)
+            and (provider is None or row["provider"] == provider)]
+
+
+def credential_health(row: Any) -> tuple[str, bool]:
+    """(label, needs attention) for a credential, shared by the dashboard and the sidebar."""
+    if row["status"] == "Erro":
+        return "Falha na última análise", True
+    expiry = parse_date(row["expires_at"]) if row["expires_at"] else None
+    if expiry:
+        days = (expiry - datetime.now(timezone.utc)).days
+        if days <= 0:
+            return "Credencial expirada", True
+        if days <= 15:
+            return f"Credencial expira em {days}d", True
+    return ("Analisado", False) if row["last_synced_at"] else ("Aguardando análise", False)
+
+
+def compliance_metrics(connection: DatabaseConnection, ids: list[int]) -> dict[str, Any]:
+    marks, params = placeholders(ids), tuple(ids)
+    rules: dict[str, dict[str, int]] = {}
+    for row in connection.execute(
+        f"""SELECT rule_code,COUNT(*) total,SUM(CASE WHEN severity IN ('critical','high') THEN 1 ELSE 0 END) severe
+            FROM findings WHERE status='open' AND credential_id IN ({marks}) GROUP BY rule_code""", params
+    ).fetchall():
+        rules[row["rule_code"]] = {"total": row["total"], "severe": row["severe"] or 0}
+    count = lambda query: connection.execute(query, params).fetchone()["count"]
+    now = utc_now()
+    latest_telemetry = connection.execute(
+        f"""SELECT s.telemetry_status FROM scans s WHERE s.id IN (SELECT MAX(id) FROM scans WHERE status='completed'
+            AND credential_id IN ({marks}) GROUP BY credential_id)""", params
+    ).fetchall()
+    campaigns = connection.execute(
+        f"""SELECT c.id,c.due_at,c.completed_at,(SELECT COUNT(*) FROM review_items i WHERE i.campaign_id=c.id AND i.decision IS NULL) pending
+            FROM review_campaigns c WHERE c.credential_id IS NULL OR c.credential_id IN ({marks})""", params
+    ).fetchall()
+    privileged = count(f"SELECT COUNT(*) count FROM access_grants WHERE privileged=1 AND credential_id IN ({marks})")
+    jit = count(f"""SELECT COUNT(*) count FROM access_grants a WHERE a.privileged=1 AND a.credential_id IN ({marks}) AND EXISTS(
+                    SELECT 1 FROM access_requests r WHERE r.credential_id=a.credential_id AND r.identity_external_id=a.identity_external_id
+                    AND r.resource_id=a.resource_id AND r.role_name=a.role_name AND r.action='jit')""")
+    scans = count(f"SELECT COUNT(*) count FROM scans WHERE status='completed' AND credential_id IN ({marks})")
+    return {
+        "assessed": scans > 0, "scans": scans, "rules": rules, "environments": len(ids),
+        "mfa_known": count(f"SELECT COUNT(*) count FROM identities WHERE identity_type='user' AND enabled=1 AND mfa_enabled IS NOT NULL AND credential_id IN ({marks})"),
+        "mfa_missing": count(f"SELECT COUNT(*) count FROM identities WHERE identity_type='user' AND enabled=1 AND mfa_enabled=0 AND credential_id IN ({marks})"),
+        "audit_events": connection.execute("SELECT COUNT(*) count FROM audit_events").fetchone()["count"],
+        "telemetry_envs": sum(1 for row in latest_telemetry if row["telemetry_status"] in {"collected", "partial"}),
+        "grants": count(f"SELECT COUNT(*) count FROM access_grants WHERE credential_id IN ({marks})"),
+        "campaigns": len(campaigns),
+        "campaigns_overdue": sum(1 for row in campaigns if not row["completed_at"] and row["pending"] and row["due_at"] < now),
+        "privileged": privileged, "privileged_standing": privileged - jit,
+        "critical_open": count(f"SELECT COUNT(*) count FROM findings WHERE status='open' AND severity='critical' AND credential_id IN ({marks})"),
+    }
+
+
+def first_seen(connection: DatabaseConnection, row: Any) -> str:
+    found = connection.execute(
+        """SELECT MIN(created_at) first FROM findings WHERE credential_id=? AND rule_code=? AND title=?
+           AND COALESCE(identity_external_id,'')=? AND COALESCE(resource_id,'')=?""",
+        (row["credential_id"], row["rule_code"], row["title"], row["identity_external_id"] or "", row["resource_id"] or ""),
+    ).fetchone()
+    return found["first"] or row["created_at"]
+
+
+def identity_label(connection: DatabaseConnection, credential_id: int, external_id: str | None) -> str:
+    if not external_id:
+        return "Ambiente"
+    row = connection.execute("SELECT display_name FROM identities WHERE credential_id=? AND external_id=?",
+                             (credential_id, external_id)).fetchone()
+    return row["display_name"] if row else external_id
+
+
+def resource_label(connection: DatabaseConnection, credential_id: int, resource_id: str | None) -> str:
+    if not resource_id:
+        return ""
+    row = connection.execute("SELECT display_name FROM cloud_resources WHERE credential_id=? AND external_id=?",
+                             (credential_id, resource_id)).fetchone()
+    if row:
+        return row["display_name"]
+    grant = connection.execute("SELECT resource_name FROM access_grants WHERE credential_id=? AND resource_id=? LIMIT 1",
+                               (credential_id, resource_id)).fetchone()
+    return grant["resource_name"] if grant else resource_id
+
+
+def trend_series(scans: list[Any], weights: dict[int, int], period: int) -> list[dict[str, Any]]:
+    """Daily consolidated risk: each credential contributes its latest score up to that day, weighted by identities."""
+    if not scans:
+        return []
+    today = datetime.now(timezone.utc).date()
+    first_day = min(parse_date(row["finished_at"]).date() for row in scans)
+    start = max(first_day, today - timedelta(days=period - 1))
+    days = [start + timedelta(days=offset) for offset in range((today - start).days + 1)]
+    step = max(1, len(days) // 14)
+    sampled = days[::step]
+    if sampled[-1] != today:
+        sampled.append(today)
+    points = []
+    for day in sampled:
+        latest: dict[int, int] = {}
+        for row in scans:
+            if parse_date(row["finished_at"]).date() <= day:
+                latest[row["credential_id"]] = row["risk_score"]
+        if not latest:
+            continue
+        total_weight = sum(max(1, weights.get(key, 1)) for key in latest)
+        posture = sum(value * max(1, weights.get(key, 1)) for key, value in latest.items()) / total_weight
+        points.append({"date": day.isoformat(), "risk": round(100 - posture)})
+    return points
+
+
+def dashboard_overview(credential_id: int | None, provider: str | None, period: int) -> dict[str, Any]:
+    period = period if period in {7, 30, 90} else 90
+    now = datetime.now(timezone.utc)
+    window_start = (now - timedelta(days=period)).isoformat()
+    with db() as connection:
+        every = connection.execute("SELECT * FROM credentials ORDER BY name").fetchall()
+        scoped = scoped_credentials(connection, credential_id, provider)
+        ids = [row["id"] for row in scoped]
+        all_ids = [row["id"] for row in every]
+        marks, params = placeholders(ids), tuple(ids)
+        all_marks, all_params = placeholders(all_ids), tuple(all_ids)
+        open_all = connection.execute(
+            f"""SELECT f.*,c.provider FROM findings f JOIN credentials c ON c.id=f.credential_id
+                WHERE f.status='open' AND f.credential_id IN ({all_marks})""", all_params
+        ).fetchall()
+        open_scoped = [row for row in open_all if row["credential_id"] in ids]
+        identity_by_credential = {row["credential_id"]: row["count"] for row in connection.execute(
+            f"SELECT credential_id,COUNT(*) count FROM identities WHERE credential_id IN ({all_marks}) GROUP BY credential_id", all_params).fetchall()}
+        grants_by_credential = {row["credential_id"]: row["count"] for row in connection.execute(
+            f"SELECT credential_id,COUNT(*) count FROM access_grants WHERE credential_id IN ({all_marks}) GROUP BY credential_id", all_params).fetchall()}
+        privileged = connection.execute(f"SELECT COUNT(*) count FROM access_grants WHERE privileged=1 AND credential_id IN ({marks})", params).fetchone()["count"]
+        scans = connection.execute(
+            f"""SELECT credential_id,risk_score,identity_count,access_count,finished_at FROM scans
+                WHERE status='completed' AND risk_score IS NOT NULL AND credential_id IN ({marks}) ORDER BY finished_at""", params
+        ).fetchall()
+        known_before = {finding_key(row["rule_code"], row["identity_external_id"], row["resource_id"], row["title"]) + (row["credential_id"],)
+                        for row in connection.execute(
+                            f"""SELECT DISTINCT credential_id,rule_code,identity_external_id,resource_id,title FROM findings
+                                WHERE created_at<? AND credential_id IN ({marks})""", (window_start, *params)).fetchall()}
+        resources = connection.execute(
+            f"""SELECT r.credential_id,r.external_id,r.display_name,r.resource_type,
+                COUNT(DISTINCT a.identity_external_id) identity_count,COUNT(a.id) grant_count
+                FROM cloud_resources r LEFT JOIN access_grants a ON a.credential_id=r.credential_id AND a.resource_id=r.external_id
+                WHERE r.resource_type<>'repository' AND r.credential_id IN ({marks})
+                GROUP BY r.credential_id,r.external_id,r.display_name,r.resource_type""", params
+        ).fetchall()
+        anomalies_24h = connection.execute(
+            f"SELECT COUNT(*) count FROM telemetry_events WHERE anomalous=1 AND occurred_at>=? AND credential_id IN ({marks})",
+            ((now - timedelta(hours=24)).isoformat(), *params)).fetchone()["count"]
+        recent_events = connection.execute(
+            f"""SELECT t.*,c.provider FROM telemetry_events t JOIN credentials c ON c.id=t.credential_id
+                WHERE t.anomalous=1 AND t.credential_id IN ({marks}) ORDER BY t.occurred_at DESC LIMIT 5""", params
+        ).fetchall()
+        top = sorted(open_scoped, key=lambda row: (SEVERITY_ORDER.get(row["severity"], 9), row["id"]))[:5]
+        priorities = [{"id": row["id"], "severity": row["severity"], "rule": RULE_CATALOG.get(row["rule_code"], {}).get("name", row["rule_code"]),
+                       "title": row["title"], "who": identity_label(connection, row["credential_id"], row["identity_external_id"]),
+                       "where": f"{row['provider']} {resource_label(connection, row['credential_id'], row['resource_id'])}".strip(),
+                       "firstSeen": first_seen(connection, row)} for row in top]
+        recent = [{"time": row["occurred_at"], "title": row["description"] or row["method"], "who": row["identity_external_id"],
+                   "provider": row["provider"], "category": classify_event(row["method"], bool(row["denied"]), row["occurred_at"])}
+                  for row in recent_events]
+        metrics = compliance_metrics(connection, ids)
+        orphan = sum(1 for row in open_scoped if row["rule_code"] == "ORPHAN_ACCOUNT")
+    severities = {level: sum(1 for row in open_scoped if row["severity"] == level) for level in ("critical", "high", "medium", "low")}
+    identities = sum(identity_by_credential.get(key, 0) for key in ids)
+    accesses = sum(grants_by_credential.get(key, 0) for key in ids)
+    assessed = bool(scans)
+    score = risk_score([row["severity"] for row in open_scoped], identities + accesses) if assessed else None
+
+    def baseline(field: str) -> int | None:
+        before: dict[int, int] = {}
+        for row in scans:
+            if row["finished_at"] < window_start:
+                before[row["credential_id"]] = row[field]
+        return sum(before.values()) if before else None
+
+    providers = []
+    for name in ("GCP", "AWS", "Azure"):
+        provider_ids = [row["id"] for row in every if row["provider"] == name]
+        if not provider_ids:
+            continue
+        rows = [row for row in open_all if row["credential_id"] in provider_ids]
+        objects = sum(identity_by_credential.get(key, 0) + grants_by_credential.get(key, 0) for key in provider_ids)
+        synced = any(row["last_synced_at"] for row in every if row["id"] in provider_ids)
+        providers.append({"provider": name, "environments": len(provider_ids),
+                          "score": risk_score([row["severity"] for row in rows], objects) if synced else None,
+                          "risks": len(rows), "critical": sum(1 for row in rows if row["severity"] == "critical"),
+                          "identities": sum(identity_by_credential.get(key, 0) for key in provider_ids)})
+    findings_by_resource: dict[tuple[int, str], list[str]] = {}
+    for row in open_scoped:
+        if row["resource_id"]:
+            findings_by_resource.setdefault((row["credential_id"], row["resource_id"]), []).append(row["severity"])
+    credential_by_id = {row["id"]: row for row in every}
+    environment_rows = []
+    for row in resources:
+        severities_here = findings_by_resource.get((row["credential_id"], row["external_id"]), [])
+        health, attention = credential_health(credential_by_id[row["credential_id"]])
+        environment_rows.append({
+            "credentialId": row["credential_id"], "resourceId": row["external_id"], "name": row["display_name"],
+            "type": row["resource_type"], "provider": credential_by_id[row["credential_id"]]["provider"],
+            "identities": row["identity_count"], "critical": severities_here.count("critical"), "high": severities_here.count("high"),
+            "score": risk_score(severities_here, row["identity_count"] + row["grant_count"]),
+            "status": health, "attention": attention,
+        })
+    environment_rows.sort(key=lambda item: (-item["score"], -item["critical"], -item["identities"], item["name"]))
+    heatmap = []
+    provider_names = [item["provider"] for item in providers]
+    for module, codes in MODULES:
+        heatmap.append({"module": module, "cells": {name: sum(1 for row in open_all if row["provider"] == name
+                                                              and (codes is None or row["rule_code"] in codes)) for name in provider_names}})
+    frameworks = framework_report(metrics)
+    return {
+        "period": period, "assessed": assessed, "score": score,
+        "level": risk_level(score) if score is not None else None,
+        "severities": severities, "total": len(open_scoped),
+        "newRisks": sum(1 for row in open_scoped if finding_key(row["rule_code"], row["identity_external_id"], row["resource_id"], row["title"]) + (row["credential_id"],) not in known_before),
+        "environmentCount": len(scoped), "providerCount": len({row["provider"] for row in scoped}),
+        "orphanAccounts": orphan,
+        "providers": providers,
+        "kpis": {"identities": identities, "identitiesBefore": baseline("identity_count"),
+                 "accesses": accesses, "accessesBefore": baseline("access_count"),
+                 "privileged": privileged, "orphanAccounts": orphan, "anomalies24h": anomalies_24h,
+                 "compliance": round(sum(item["percent"] for item in frameworks) / len(frameworks)) if assessed else None},
+        "trend": trend_series(scans, identity_by_credential, period),
+        "rules": [{"code": code, "name": rule["name"], "count": sum(1 for row in open_scoped if row["rule_code"] == code)}
+                  for code, rule in RULE_CATALOG.items()],
+        "heatmap": heatmap, "environments": environment_rows[:10], "environmentTotal": len(environment_rows),
+        "priorities": priorities, "ueba": recent,
+        "frameworks": [{"key": item["key"], "name": item["name"], "percent": item["percent"], "met": item["met"],
+                        "total": item["total"]} for item in frameworks],
+        "credentials": [{"id": row["id"], "name": row["name"], "provider": row["provider"]} for row in every],
+        "lastAnalysisAt": scans[-1]["finished_at"] if scans else None,
+    }
+
+
+@app.get("/api/dashboard/overview")
+def dashboard_overview_endpoint(credential_id: int | None = None, provider: Literal["GCP", "AWS", "Azure"] | None = None,
+                                period: int = Query(90, ge=1, le=365)) -> dict[str, Any]:
+    return dashboard_overview(credential_id, provider, period)
+
+
+@app.get("/api/platform/status")
+def platform_status() -> dict[str, Any]:
+    with db() as connection:
+        rows = connection.execute("SELECT * FROM credentials").fetchall()
+        last = connection.execute("SELECT MAX(finished_at) last FROM scans WHERE status='completed'").fetchone()["last"]
+        critical = connection.execute("SELECT COUNT(*) count FROM findings WHERE status='open' AND severity='critical'").fetchone()["count"]
+    attention = sum(1 for row in rows if credential_health(row)[1])
+    return {"integrations": len(rows), "connected": sum(1 for row in rows if row["last_synced_at"]),
+            "attention": attention, "lastAnalysisAt": last, "criticalOpen": critical}
+
+
+RISK_WEIGHT_SQL = "CASE f.severity WHEN 'critical' THEN 40 WHEN 'high' THEN 25 WHEN 'medium' THEN 10 ELSE 5 END"
 
 
 @app.get("/api/identities")
 def list_identities(credential_id: int | None = None, q: str | None = None,
                     offset: int = Query(0, ge=0), limit: int = Query(200, ge=1, le=10000)) -> list[dict[str, Any]]:
-    query = """SELECT i.*, c.name AS credential_name, c.provider,
+    query = f"""SELECT i.*, c.name AS credential_name, c.provider,
         (SELECT COUNT(*) FROM access_grants a WHERE a.credential_id=i.credential_id AND a.identity_external_id=i.external_id) AS access_count,
         (SELECT COUNT(*) FROM access_grants a WHERE a.credential_id=i.credential_id AND a.identity_external_id=i.external_id AND a.privileged=1) AS privileged_count,
         (SELECT COUNT(DISTINCT a.resource_id) FROM access_grants a WHERE a.credential_id=i.credential_id AND a.identity_external_id=i.external_id) AS resource_count,
         (SELECT COUNT(*) FROM findings f WHERE f.credential_id=i.credential_id AND f.identity_external_id=i.external_id AND f.status='open') AS finding_count,
+        (SELECT COALESCE(SUM({RISK_WEIGHT_SQL}),0) FROM findings f WHERE f.credential_id=i.credential_id AND f.identity_external_id=i.external_id AND f.status='open') AS risk_weight,
+        (SELECT COUNT(*) FROM findings f WHERE f.credential_id=i.credential_id AND f.identity_external_id=i.external_id AND f.status='open' AND f.rule_code='ORPHAN_ACCOUNT') AS orphan_count,
         (SELECT f.severity FROM findings f WHERE f.credential_id=i.credential_id AND f.identity_external_id=i.external_id AND f.status='open'
          ORDER BY CASE f.severity WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 ELSE 4 END LIMIT 1) AS max_severity
         FROM identities i JOIN credentials c ON c.id=i.credential_id"""
@@ -978,18 +1650,37 @@ def list_identities(credential_id: int | None = None, q: str | None = None,
         params.extend((term, term, term))
     if clauses:
         query += " WHERE " + " AND ".join(clauses)
-    query += " ORDER BY i.display_name LIMIT ? OFFSET ?"
+    query += " ORDER BY risk_weight DESC, i.display_name LIMIT ? OFFSET ?"
     params.extend((limit, offset))
     with db() as connection:
         rows = connection.execute(query, tuple(params)).fetchall()
     return [{"id": row["id"], "credentialId": row["credential_id"], "externalId": row["external_id"],
              "name": row["display_name"], "type": row["identity_type"], "email": row["email"],
              "enabled": bool(row["enabled"]), "mfaEnabled": None if row["mfa_enabled"] is None else bool(row["mfa_enabled"]),
-             "owner": row["owner"], "lifecycleStatus": row["lifecycle_status"],
+             "owner": row["owner"], "lifecycleStatus": row["lifecycle_status"], "lastSeenAt": row["last_seen_at"],
              "environment": row["credential_name"], "provider": row["provider"],
              "accessCount": row["access_count"], "privilegedCount": row["privileged_count"],
              "resourceCount": row["resource_count"], "findingCount": row["finding_count"],
+             "orphan": bool(row["orphan_count"]), "riskScore": min(100, int(row["risk_weight"] or 0)),
              "maxSeverity": row["max_severity"]} for row in rows]
+
+
+@app.get("/api/identities/summary")
+def identities_summary(credential_id: int | None = None) -> dict[str, Any]:
+    clause, params = (" AND credential_id=?", (credential_id,)) if credential_id is not None else ("", ())
+    inactive_before = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+    with db() as connection:
+        count = lambda condition, extra=(): connection.execute(
+            f"SELECT COUNT(*) count FROM identities WHERE {condition}{clause}", (*extra, *params)).fetchone()["count"]
+        orphan = connection.execute(
+            f"SELECT COUNT(DISTINCT identity_external_id) count FROM findings WHERE status='open' AND rule_code='ORPHAN_ACCOUNT'{clause}",
+            params).fetchone()["count"]
+        return {"total": count("1=1"), "humans": count("identity_type='user'"), "services": count("identity_type='service'"),
+                "groups": count("identity_type='group'"), "orphan": orphan,
+                "noMfa": count("identity_type='user' AND enabled=1 AND mfa_enabled=0"),
+                "mfaKnown": count("identity_type='user' AND enabled=1 AND mfa_enabled IS NOT NULL"),
+                "inactive90": count("last_seen_at IS NOT NULL AND last_seen_at<?", (inactive_before,)),
+                "lastSeenKnown": count("last_seen_at IS NOT NULL")}
 
 
 @app.get("/api/identities/{identity_id}")
@@ -1035,6 +1726,7 @@ def identity_dossier(identity_id: int) -> dict[str, Any]:
             "lifecycleStatus": identity["lifecycle_status"], "lastSeenAt": identity["last_seen_at"],
             "credentialId": identity["credential_id"], "environment": identity["credential_name"],
             "provider": identity["provider"], "accesses": accesses, "findings": risks,
+            "riskScore": identity_risk([item["severity"] for item in risks]),
             "resourceCount": len({item["resourceId"] for item in accesses}),
             "privilegedCount": sum(1 for item in accesses if item["privileged"])}
 
@@ -1135,22 +1827,79 @@ def project_drilldown(credential_id: int, resource_id: str) -> dict[str, Any]:
             "accessCount": len(grants), "risks": severities}
 
 
+WILDCARD_ROLES = {"roles/owner", "AdministratorAccess", "Owner", "*:*"}
+
+
+def grant_origin(identity_type: str | None) -> str:
+    return {"group": "Grupo", "public": "Público"}.get(identity_type or "", "Direta")
+
+
 @app.get("/api/accesses")
 def list_accesses(credential_id: int | None = None, limit: int = Query(200, ge=1, le=20000)) -> list[dict[str, Any]]:
-    query = "SELECT * FROM access_grants"
+    query = """SELECT a.*,i.display_name identity_name,i.identity_type,i.id identity_db_id,c.name environment,c.provider,
+               COALESCE(r.resource_type,'resource') resource_type FROM access_grants a
+               JOIN credentials c ON c.id=a.credential_id
+               LEFT JOIN identities i ON i.credential_id=a.credential_id AND i.external_id=a.identity_external_id
+               LEFT JOIN cloud_resources r ON r.credential_id=a.credential_id AND r.external_id=a.resource_id"""
     params: tuple[Any, ...] = ()
     if credential_id is not None:
-        query += " WHERE credential_id=?"
+        query += " WHERE a.credential_id=?"
         params = (credential_id,)
-    query += " ORDER BY id DESC LIMIT ?"
+    query += " ORDER BY a.privileged DESC,a.id DESC LIMIT ?"
     params = (*params, limit)
     with db() as connection:
         rows = connection.execute(query, params).fetchall()
-    return [{"id": row["id"], "credentialId": row["credential_id"], "identityId": row["identity_external_id"],
-             "resourceId": row["resource_id"], "resourceName": row["resource_name"], "role": row["role_name"],
-             "permissions": json.loads(row["permissions_json"]), "privileged": bool(row["privileged"]),
-             "grantedAt": row["granted_at"], "lastUsedAt": row["last_used_at"],
-             "lastReviewedAt": row["last_reviewed_at"]} for row in rows]
+    result = []
+    for row in rows:
+        permissions = json.loads(row["permissions_json"])
+        result.append({"id": row["id"], "credentialId": row["credential_id"], "identityId": row["identity_external_id"],
+                       "identityDbId": row["identity_db_id"], "identityName": row["identity_name"] or row["identity_external_id"],
+                       "identityType": row["identity_type"], "origin": grant_origin(row["identity_type"]),
+                       "environment": row["environment"], "provider": row["provider"], "resourceType": row["resource_type"],
+                       "resourceId": row["resource_id"], "resourceName": row["resource_name"], "role": row["role_name"],
+                       "permissions": permissions, "privileged": bool(row["privileged"]),
+                       "wildcard": row["role_name"] in WILDCARD_ROLES or any("*" in str(item) for item in permissions),
+                       "grantedAt": row["granted_at"], "lastUsedAt": row["last_used_at"],
+                       "lastReviewedAt": row["last_reviewed_at"]})
+    return result
+
+
+@app.get("/api/accesses/summary")
+def accesses_summary(credential_id: int | None = None) -> dict[str, Any]:
+    with db() as connection:
+        unused_days = load_settings(connection)["rules"]["unused_days"]
+        rows = connection.execute(
+            """SELECT a.role_name,a.permissions_json,a.last_used_at,i.identity_type,c.provider FROM access_grants a
+               JOIN credentials c ON c.id=a.credential_id
+               LEFT JOIN identities i ON i.credential_id=a.credential_id AND i.external_id=a.identity_external_id"""
+            + (" WHERE a.credential_id=?" if credential_id is not None else ""), (credential_id,) if credential_id is not None else ()
+        ).fetchall()
+        resources = connection.execute(
+            "SELECT COUNT(*) count FROM cloud_resources" + (" WHERE credential_id=?" if credential_id is not None else ""),
+            (credential_id,) if credential_id is not None else ()).fetchone()["count"]
+    cutoff = datetime.now(timezone.utc) - timedelta(days=unused_days)
+    by_provider: dict[str, dict[str, int]] = {}
+    unused = with_usage = direct = group = wildcard = 0
+    for row in rows:
+        stats = by_provider.setdefault(row["provider"], {"total": 0, "withUsage": 0, "unused": 0})
+        stats["total"] += 1
+        last = parse_date(row["last_used_at"]) if row["last_used_at"] else None
+        if last:
+            last = last if last.tzinfo else last.replace(tzinfo=timezone.utc)
+            with_usage += 1
+            stats["withUsage"] += 1
+            if last < cutoff:
+                unused += 1
+                stats["unused"] += 1
+        if grant_origin(row["identity_type"]) == "Grupo":
+            group += 1
+        else:
+            direct += 1
+        if row["role_name"] in WILDCARD_ROLES or "*" in (row["permissions_json"] or ""):
+            wildcard += 1
+    return {"total": len(rows), "resources": resources, "unusedDays": unused_days, "unused": unused, "withUsage": with_usage,
+            "direct": direct, "group": group, "wildcard": wildcard,
+            "byProvider": [{"provider": key, **value} for key, value in sorted(by_provider.items())]}
 
 
 @app.get("/api/resources")
@@ -1168,29 +1917,52 @@ def list_resources(credential_id: int | None = None, limit: int = Query(200, ge=
              "name": row["display_name"], "type": row["resource_type"]} for row in rows]
 
 
+CURRENT_FINDING_STATUSES = ("open", "remediating", "accepted", "incident", "dismissed")
+
+
 @app.get("/api/findings")
-def list_findings(credential_id: int | None = None, finding_status: str = "open",
+def list_findings(credential_id: int | None = None, finding_status: str = "open", rule: str | None = None,
                   limit: int = Query(200, ge=1, le=20000)) -> list[dict[str, Any]]:
-    clauses = ["status=?"]
-    params: list[Any] = [finding_status]
+    statuses = CURRENT_FINDING_STATUSES if finding_status == "current" else (finding_status,)
+    clauses = [f"f.status IN ({placeholders(list(statuses))})"]
+    params: list[Any] = list(statuses)
     if credential_id is not None:
-        clauses.append("credential_id=?")
+        clauses.append("f.credential_id=?")
         params.append(credential_id)
+    if rule:
+        clauses.append("f.rule_code=?")
+        params.append(rule)
     params.append(limit)
     with db() as connection:
         rows = connection.execute(
-            f"SELECT * FROM findings WHERE {' AND '.join(clauses)} ORDER BY CASE severity WHEN 'critical' THEN 1 WHEN 'high' THEN 2 ELSE 3 END, id DESC LIMIT ?",
+            f"""SELECT f.*,c.name environment,c.provider,COALESCE(i.display_name,f.identity_external_id) identity_name,
+                COALESCE(r.display_name,f.resource_id) resource_name,
+                (SELECT MIN(f2.created_at) FROM findings f2 WHERE f2.credential_id=f.credential_id AND f2.rule_code=f.rule_code
+                 AND f2.title=f.title AND COALESCE(f2.identity_external_id,'')=COALESCE(f.identity_external_id,'')
+                 AND COALESCE(f2.resource_id,'')=COALESCE(f.resource_id,'')) first_seen
+                FROM findings f JOIN credentials c ON c.id=f.credential_id
+                LEFT JOIN identities i ON i.credential_id=f.credential_id AND i.external_id=f.identity_external_id
+                LEFT JOIN cloud_resources r ON r.credential_id=f.credential_id AND r.external_id=f.resource_id
+                WHERE {' AND '.join(clauses)}
+                ORDER BY CASE f.severity WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 ELSE 4 END, f.id DESC LIMIT ?""",
             tuple(params),
         ).fetchall()
-    return [{"id": row["id"], "credentialId": row["credential_id"], "scanId": row["scan_id"],
-             "rule": row["rule_code"], "severity": row["severity"], "title": row["title"],
-             "description": row["description"], "identityId": row["identity_external_id"],
-             "resourceId": row["resource_id"], "status": row["status"], "createdAt": row["created_at"],
-             "why": RULE_CATALOG.get(row["rule_code"], DEFAULT_RULE_GUIDANCE).get("why", DEFAULT_RULE_GUIDANCE["why"]),
-             "recommendation": RULE_CATALOG.get(row["rule_code"], DEFAULT_RULE_GUIDANCE).get("recommendation", DEFAULT_RULE_GUIDANCE["recommendation"]),
-             "treatment": RULE_CATALOG.get(row["rule_code"], DEFAULT_RULE_GUIDANCE).get("treatment", DEFAULT_RULE_GUIDANCE["treatment"]),
-             "framework": RULE_CATALOG.get(row["rule_code"], {}).get("framework", "IGA")}
-            for row in rows]
+    result = []
+    for row in rows:
+        guidance = RULE_CATALOG.get(row["rule_code"], DEFAULT_RULE_GUIDANCE)
+        result.append({"id": row["id"], "credentialId": row["credential_id"], "scanId": row["scan_id"],
+                       "rule": row["rule_code"], "ruleName": RULE_CATALOG.get(row["rule_code"], {}).get("name", row["rule_code"]),
+                       "severity": row["severity"], "title": row["title"], "description": row["description"],
+                       "identityId": row["identity_external_id"], "identityName": row["identity_name"],
+                       "resourceId": row["resource_id"], "resourceName": row["resource_name"],
+                       "environment": row["environment"], "provider": row["provider"],
+                       "status": row["status"], "createdAt": row["created_at"], "firstSeen": row["first_seen"] or row["created_at"],
+                       "updatedAt": row["updated_at"],
+                       "why": guidance.get("why", DEFAULT_RULE_GUIDANCE["why"]),
+                       "recommendation": guidance.get("recommendation", DEFAULT_RULE_GUIDANCE["recommendation"]),
+                       "treatment": guidance.get("treatment", DEFAULT_RULE_GUIDANCE["treatment"]),
+                       "framework": RULE_CATALOG.get(row["rule_code"], {}).get("framework", "IGA")})
+    return result
 
 
 @app.get("/api/rules")
@@ -1205,59 +1977,137 @@ def rule_assessments(credential_id: int | None = None) -> list[dict[str, Any]]:
         providers = {row["provider"] for row in connection.execute(
             f"SELECT provider FROM credentials{credential_filter}", params
         ).fetchall()}
+        limits = load_settings(connection)["rules"]
     result = []
     for code, rule in RULE_CATALOG.items():
         count = counts.get(code, 0)
         supported = bool(providers.intersection(rule["providers"]))
+        description, criterion = RULE_DETAILS.get(code, ("", ""))
         result.append({"code": code, "name": rule["name"], "framework": rule["framework"],
-                       "control": rule["control"], "findings": count,
+                       "control": rule["control"], "findings": count, "description": description,
+                       "criterion": criterion.format(**limits),
                        "status": "failed" if count else "passed" if supported else "not_assessed"})
     return result
 
 
+FINDING_STATUS_LABEL = {"open": "Aberto", "resolved": "Resolvido", "accepted": "Risco aceito", "dismissed": "Descartado",
+                        "remediating": "Em remediação", "incident": "Incidente aberto"}
+
+
 @app.patch("/api/findings/{finding_id}")
 def update_finding(finding_id: int, payload: FindingUpdate, request: Request) -> dict[str, Any]:
+    if payload.status in {"accepted", "dismissed"} and not payload.justification:
+        raise HTTPException(422, "Informe a justificativa para aceitar ou descartar o risco.")
     with db() as connection:
         row = connection.execute("SELECT * FROM findings WHERE id=?", (finding_id,)).fetchone()
         if not row:
             raise HTTPException(404, "Achado não encontrado")
         previous = row["status"]
-        connection.execute("UPDATE findings SET status=? WHERE id=?", (payload.status, finding_id))
+        connection.execute("UPDATE findings SET status=?,updated_at=? WHERE id=?", (payload.status, utc_now(), finding_id))
+        justification = payload.justification or f"{FINDING_STATUS_LABEL[payload.status]} por {request.state.user['email']}."
         audit(connection, "risk", "Postura de risco alterada",
-              f"{row['title']}: {previous} → {payload.status}. Justificativa: {payload.justification}", request.state.user["email"])
+              f"{row['title']}: {previous} → {payload.status}. Justificativa: {justification}", request.state.user["email"],
+              action=f"finding.{payload.status}", target=f"F-{finding_id} · {row['title']}",
+              details={"from": previous, "to": payload.status, "justification": justification, "rule": row["rule_code"]})
         updated = connection.execute("SELECT * FROM findings WHERE id=?", (finding_id,)).fetchone()
     return {"id": updated["id"], "rule": updated["rule_code"], "severity": updated["severity"],
             "title": updated["title"], "status": updated["status"]}
 
 
-@app.get("/api/privileged-access")
-def privileged_access(credential_id: int | None = None, limit: int = Query(200, ge=1, le=20000)) -> list[dict[str, Any]]:
+PRIVILEGE_BASE_SCORE = {"critical": 85, "high": 70, "medium": 45, "low": 20}
+BREAK_GLASS_MARKERS = ("break-glass", "breakglass", "break_glass", "emergency")
+
+
+def privileged_rows(connection: DatabaseConnection, credential_id: int | None, limit: int) -> list[dict[str, Any]]:
     clauses = ["a.privileged=1"]
     params: list[Any] = []
     if credential_id is not None:
         clauses.append("a.credential_id=?")
         params.append(credential_id)
     params.append(limit)
-    with db() as connection:
-        rows = connection.execute(
-            f"""SELECT a.*,i.display_name identity_name,i.identity_type,i.email,c.name environment,c.provider,
-                       COALESCE(r.resource_type,'project') resource_type
-                FROM access_grants a
-                LEFT JOIN identities i ON i.credential_id=a.credential_id AND i.external_id=a.identity_external_id
-                JOIN credentials c ON c.id=a.credential_id
-                LEFT JOIN cloud_resources r ON r.credential_id=a.credential_id AND r.external_id=a.resource_id
-                WHERE {' AND '.join(clauses)} ORDER BY c.name,i.display_name LIMIT ?""", tuple(params)
-        ).fetchall()
+    rows = connection.execute(
+        f"""SELECT a.*,i.display_name identity_name,i.identity_type,i.email,i.mfa_enabled,i.id identity_db_id,
+                   c.name environment,c.provider,COALESCE(r.resource_type,'project') resource_type,
+                   (SELECT q.created_at FROM access_requests q WHERE q.credential_id=a.credential_id AND q.identity_external_id=a.identity_external_id
+                    AND q.resource_id=a.resource_id AND q.role_name=a.role_name AND q.action='jit' ORDER BY q.id DESC LIMIT 1) jit_requested_at
+            FROM access_grants a
+            LEFT JOIN identities i ON i.credential_id=a.credential_id AND i.external_id=a.identity_external_id
+            JOIN credentials c ON c.id=a.credential_id
+            LEFT JOIN cloud_resources r ON r.credential_id=a.credential_id AND r.external_id=a.resource_id
+            WHERE {' AND '.join(clauses)} ORDER BY c.name,i.display_name LIMIT ?""", tuple(params)
+    ).fetchall()
+    unused_days = load_settings(connection)["rules"]["unused_days"]
     result = []
     for row in rows:
         context = role_context(row["provider"], row["role_name"], row["resource_type"])
+        unused = days_since(row["last_used_at"])
+        mfa = None if row["mfa_enabled"] is None else bool(row["mfa_enabled"])
+        score = PRIVILEGE_BASE_SCORE.get(context["severity"], 45) + (10 if mfa is False else 0) + (5 if unused is not None and unused > unused_days else 0)
+        name = row["identity_name"] or row["identity_external_id"]
         result.append({"id": row["id"], "credentialId": row["credential_id"], "identityId": row["identity_external_id"],
-                       "identityName": row["identity_name"] or row["identity_external_id"], "identityType": row["identity_type"],
+                       "identityDbId": row["identity_db_id"], "identityName": name, "identityType": row["identity_type"],
                        "email": row["email"], "environment": row["environment"], "provider": row["provider"],
                        "resourceId": row["resource_id"], "resourceName": row["resource_name"], "resourceType": row["resource_type"],
                        "role": row["role_name"], "roleLabel": context["label"], "capability": context["capability"],
-                       "severity": context["severity"], "lastUsedAt": row["last_used_at"], "lastReviewedAt": row["last_reviewed_at"]})
+                       "severity": context["severity"], "lastUsedAt": row["last_used_at"], "lastReviewedAt": row["last_reviewed_at"],
+                       "mfaEnabled": mfa, "unused": unused is not None and unused > unused_days,
+                       "model": "JIT solicitado" if row["jit_requested_at"] else "Permanente", "jitRequestedAt": row["jit_requested_at"],
+                       "breakGlass": any(marker in name.lower() for marker in BREAK_GLASS_MARKERS),
+                       "riskScore": min(100, score)})
     return result
+
+
+@app.get("/api/privileged-access")
+def privileged_access(credential_id: int | None = None, limit: int = Query(200, ge=1, le=20000)) -> list[dict[str, Any]]:
+    with db() as connection:
+        rows = privileged_rows(connection, credential_id, limit)
+    return sorted(rows, key=lambda item: (-item["riskScore"], item["identityName"]))
+
+
+@app.get("/api/privileged-access/summary")
+def privileged_summary(credential_id: int | None = None) -> dict[str, Any]:
+    with db() as connection:
+        rows = privileged_rows(connection, credential_id, 20000)
+        identities = connection.execute(
+            "SELECT COUNT(*) count FROM identities" + (" WHERE credential_id=?" if credential_id is not None else ""),
+            (credential_id,) if credential_id is not None else ()).fetchone()["count"]
+    roles: dict[tuple[str, str], int] = {}
+    for row in rows:
+        roles[(row["role"], row["provider"])] = roles.get((row["role"], row["provider"]), 0) + 1
+    privileged_identities = {(row["credentialId"], row["identityId"]) for row in rows}
+    return {"grants": len(rows), "identities": len(privileged_identities), "totalIdentities": identities,
+            "standing": sum(1 for row in rows if row["model"] == "Permanente"),
+            "jit": sum(1 for row in rows if row["model"] != "Permanente"),
+            "noMfa": len({(row["credentialId"], row["identityId"]) for row in rows if row["mfaEnabled"] is False}),
+            "unused": sum(1 for row in rows if row["unused"]),
+            "breakGlass": len({(row["credentialId"], row["identityId"]) for row in rows if row["breakGlass"]}),
+            "roles": [{"role": role, "provider": provider, "count": count}
+                      for (role, provider), count in sorted(roles.items(), key=lambda item: -item[1])[:7]]}
+
+
+@app.post("/api/privileged-access/{grant_id}/jit")
+def request_jit(grant_id: int, payload: AccessRequestInput, request: Request) -> dict[str, Any]:
+    with db() as connection:
+        grant = connection.execute(
+            "SELECT a.*,c.name environment FROM access_grants a JOIN credentials c ON c.id=a.credential_id WHERE a.id=? AND a.privileged=1",
+            (grant_id,)).fetchone()
+        if not grant:
+            raise HTTPException(404, "Acesso privilegiado não encontrado")
+        exists = connection.execute(
+            """SELECT id FROM access_requests WHERE credential_id=? AND identity_external_id=? AND resource_id=? AND role_name=? AND action='jit'""",
+            (grant["credential_id"], grant["identity_external_id"], grant["resource_id"], grant["role_name"])).fetchone()
+        if not exists:
+            connection.execute(
+                """INSERT INTO access_requests(credential_id,identity_external_id,resource_id,role_name,action,status,note,requested_by,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (grant["credential_id"], grant["identity_external_id"], grant["resource_id"], grant["role_name"], "jit", "requested",
+                 payload.note, request.state.user["email"], utc_now()))
+            audit(connection, "risk", "Conversão para JIT solicitada",
+                  f"{grant['identity_external_id']}: {grant['role_name']} em {grant['resource_name']} ({grant['environment']}) deve deixar de ser permanente.",
+                  request.state.user["email"], action="privileged.jit_requested", target=grant["identity_external_id"],
+                  details={"role": grant["role_name"], "resource": grant["resource_id"], "note": payload.note or ""})
+        rows = privileged_rows(connection, grant["credential_id"], 20000)
+    return next(item for item in rows if item["id"] == grant_id)
 
 
 def privileged_dossier(grant_id: int) -> dict[str, Any]:
@@ -1439,6 +2289,69 @@ def list_ai_analyses(credential_id: int | None = None, limit: int = Query(100, g
             for row in rows]
 
 
+@app.get("/api/ueba/overview")
+def ueba_overview(credential_id: int | None = None) -> dict[str, Any]:
+    clause, params = (" AND credential_id=?", (credential_id,)) if credential_id is not None else ("", ())
+    now = datetime.now(timezone.utc)
+    day_ago = now - timedelta(hours=24)
+    with db() as connection:
+        threshold = load_settings(connection)["rules"]["ueba_threshold"]
+        recent = connection.execute(
+            f"SELECT occurred_at,anomalous FROM telemetry_events WHERE occurred_at>=?{clause}", (day_ago.isoformat(), *params)).fetchall()
+        findings = connection.execute(
+            f"""SELECT f.*,c.provider FROM findings f JOIN credentials c ON c.id=f.credential_id
+                WHERE f.rule_code='UEBA_ANOMALY' AND f.status IN ('open','incident'){clause.replace('credential_id', 'f.credential_id')}
+                ORDER BY f.id DESC LIMIT 500""", params).fetchall()
+        events = connection.execute(
+            f"SELECT * FROM telemetry_events WHERE 1=1{clause} ORDER BY occurred_at DESC LIMIT 20000", params).fetchall()
+        privileged = {(row["credential_id"], row["identity_external_id"]) for row in connection.execute(
+            f"SELECT DISTINCT credential_id,identity_external_id FROM access_grants WHERE privileged=1{clause}", params).fetchall()}
+        coverage = ueba_status(credential_id)
+        labels = {(row["credential_id"], row["external_id"]): row["display_name"] for row in connection.execute(
+            f"SELECT credential_id,external_id,display_name FROM identities WHERE 1=1{clause}", params).fetchall()}
+    hours = []
+    for offset in range(23, -1, -1):
+        start = (now - timedelta(hours=offset)).replace(minute=0, second=0, microsecond=0)
+        end = start + timedelta(hours=1)
+        bucket = [row for row in recent if row["occurred_at"] and start <= as_utc(parse_date(row["occurred_at"])) < end]
+        hours.append({"start": start.isoformat(), "events": len(bucket), "anomalies": sum(1 for row in bucket if row["anomalous"])})
+    by_identity: dict[tuple[int, str], list[Any]] = {}
+    for row in events:
+        by_identity.setdefault((row["credential_id"], row["identity_external_id"]), []).append(row)
+    anomalies = []
+    for row in findings:
+        identity_events = by_identity.get((row["credential_id"], row["identity_external_id"] or ""), [])
+        matched = [item for item in identity_events if item["anomalous"] and (item["resource_id"] or "") == (row["resource_id"] or "")
+                   and item["description"] and item["description"] in row["description"]]
+        latest = matched[0] if matched else None
+        category = classify_event(latest["method"], bool(latest["denied"]), latest["occurred_at"]) if latest else "Operação sensível"
+        deviation = round(max((item["risk_score"] for item in matched), default=0.9 if row["severity"] == "critical" else 0.8) * 100)
+        baseline = [item for item in identity_events if not item["anomalous"]]
+        expected = (f"Média de {len(baseline) / 7:.1f} evento(s) administrativos por dia desta identidade nos últimos 7 dias"
+                    if baseline else "Sem atividade administrativa regular desta identidade no período coletado")
+        observed = (f"{len(matched)} ocorrência(s) de {latest['method'] or 'operação'} em {latest['resource_id'] or 'ambiente'}"
+                    + (f" · IP {latest['caller_ip']}" if latest and latest["caller_ip"] else "")) if latest else row["description"]
+        anomalies.append({"id": row["id"], "occurredAt": latest["occurred_at"] if latest else row["created_at"],
+                          "identityId": row["identity_external_id"],
+                          "who": labels.get((row["credential_id"], row["identity_external_id"]), row["identity_external_id"]),
+                          "provider": row["provider"], "category": category, "title": row["description"].split(". ", 1)[-1],
+                          "deviation": deviation, "confidence": "alta confiança" if deviation >= 80 else "média confiança",
+                          "expected": expected, "observed": observed, "status": row["status"],
+                          "privileged": (row["credential_id"], row["identity_external_id"]) in privileged})
+    categories: dict[str, int] = {}
+    for item in anomalies:
+        categories[item["category"]] = categories.get(item["category"], 0) + 1
+    return {"threshold": threshold, "hours": hours,
+            "kpis": {"anomalies24h": sum(item["anomalies"] for item in hours),
+                     "highConfidence": sum(1 for item in anomalies if item["deviation"] >= 80),
+                     "identities": len({item["identityId"] for item in anomalies}),
+                     "privilegedIdentities": len({item["identityId"] for item in anomalies if item["privileged"]}),
+                     "eventsEvaluated": coverage["eventsEvaluated"]},
+            "categories": [{"name": name, "count": count} for name, count in sorted(categories.items(), key=lambda entry: -entry[1])],
+            "anomalies": sorted(anomalies, key=lambda item: item["occurredAt"] or "", reverse=True),
+            "coverage": coverage["environments"]}
+
+
 @app.get("/api/ueba")
 def ueba_findings(credential_id: int | None = None, limit: int = Query(200, ge=1, le=20000)) -> list[dict[str, Any]]:
     clauses = ["rule_code='UEBA_ANOMALY'", "status='open'"]
@@ -1525,6 +2438,163 @@ def compliance_report(credential_id: int | None = None) -> dict[str, Any]:
     assessed = [control for control in controls if control["status"] != "not_assessed"]
     overall = round(sum(control["score"] for control in assessed) / len(assessed)) if assessed else 0
     return {"score": overall, "controls": controls, "generatedAt": utc_now()}
+
+
+@app.get("/api/compliance/frameworks")
+def compliance_frameworks(credential_id: int | None = None) -> dict[str, Any]:
+    with db() as connection:
+        ids = [row["id"] for row in scoped_credentials(connection, credential_id, None)]
+        metrics = compliance_metrics(connection, ids)
+    return {"frameworks": framework_report(metrics), "generatedAt": utc_now()}
+
+
+def campaign_view(connection: DatabaseConnection, row: Any) -> dict[str, Any]:
+    stats = connection.execute(
+        """SELECT COUNT(*) total,SUM(CASE WHEN decision IS NOT NULL THEN 1 ELSE 0 END) decided,
+           SUM(CASE WHEN decision='keep' THEN 1 ELSE 0 END) kept,SUM(CASE WHEN decision='revoke' THEN 1 ELSE 0 END) revoked
+           FROM review_items WHERE campaign_id=?""", (row["id"],)).fetchone()
+    credential = connection.execute("SELECT name FROM credentials WHERE id=?", (row["credential_id"],)).fetchone() if row["credential_id"] else None
+    total, decided = stats["total"] or 0, stats["decided"] or 0
+    return {"id": row["id"], "name": row["name"], "scope": row["scope"], "credentialId": row["credential_id"],
+            "environment": credential["name"] if credential else "Todos os ambientes", "reviewer": row["reviewer"],
+            "dueAt": row["due_at"], "createdAt": row["created_at"], "createdBy": row["created_by"], "completedAt": row["completed_at"],
+            "total": total, "decided": decided, "kept": stats["kept"] or 0, "revoked": stats["revoked"] or 0,
+            "percent": round(decided / total * 100) if total else 100,
+            "overdue": not row["completed_at"] and decided < total and row["due_at"] < utc_now()}
+
+
+@app.get("/api/reviews")
+def list_reviews() -> list[dict[str, Any]]:
+    with db() as connection:
+        rows = connection.execute("SELECT * FROM review_campaigns ORDER BY completed_at IS NOT NULL, due_at").fetchall()
+        return [campaign_view(connection, row) for row in rows]
+
+
+@app.post("/api/reviews", status_code=status.HTTP_201_CREATED)
+def create_review(payload: ReviewCampaignInput, request: Request) -> dict[str, Any]:
+    clauses, params = ["1=1"], []
+    with db() as connection:
+        if payload.credentialId is not None:
+            clauses.append("a.credential_id=?")
+            params.append(payload.credentialId)
+        if payload.scope == "privileged":
+            clauses.append("a.privileged=1")
+        elif payload.scope == "unused":
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=load_settings(connection)["rules"]["unused_days"])).isoformat()
+            clauses.append("a.last_used_at IS NOT NULL AND a.last_used_at<?")
+            params.append(cutoff)
+        elif payload.scope == "identity":
+            identity = connection.execute("SELECT credential_id,external_id FROM identities WHERE id=?", (payload.identityId,)).fetchone()
+            if not identity:
+                raise HTTPException(404, "Identidade não encontrada")
+            clauses.append("a.credential_id=? AND a.identity_external_id=?")
+            params.extend((identity["credential_id"], identity["external_id"]))
+        grants = connection.execute(
+            f"""SELECT a.*,COALESCE(i.display_name,a.identity_external_id) identity_name FROM access_grants a
+                LEFT JOIN identities i ON i.credential_id=a.credential_id AND i.external_id=a.identity_external_id
+                WHERE {' AND '.join(clauses)} ORDER BY a.privileged DESC,a.id LIMIT 5000""", tuple(params)).fetchall()
+        if not grants:
+            raise HTTPException(422, "Nenhuma concessão encontrada para o escopo selecionado.")
+        now = utc_now()
+        due = (datetime.now(timezone.utc) + timedelta(days=payload.dueDays)).isoformat()
+        cursor = connection.execute(
+            """INSERT INTO review_campaigns(name,scope,credential_id,reviewer,due_at,created_by,created_at)
+               VALUES(?,?,?,?,?,?,?) RETURNING id""",
+            (payload.name.strip(), payload.scope, payload.credentialId, payload.reviewer.strip(), due, request.state.user["email"], now))
+        campaign_id = cursor.fetchone()["id"]
+        for grant in grants:
+            connection.execute(
+                """INSERT INTO review_items(campaign_id,credential_id,identity_external_id,identity_name,resource_id,resource_name,
+                   role_name,privileged) VALUES(?,?,?,?,?,?,?,?)""",
+                (campaign_id, grant["credential_id"], grant["identity_external_id"], grant["identity_name"], grant["resource_id"],
+                 grant["resource_name"], grant["role_name"], grant["privileged"]))
+        audit(connection, "admin", "Campanha de revisão criada", f"{payload.name}: {len(grants)} concessão(ões), revisor {payload.reviewer}.",
+              request.state.user["email"], action="review.created", target=payload.name,
+              details={"scope": payload.scope, "items": len(grants), "dueAt": due})
+        row = connection.execute("SELECT * FROM review_campaigns WHERE id=?", (campaign_id,)).fetchone()
+        return campaign_view(connection, row)
+
+
+@app.get("/api/reviews/{campaign_id}")
+def review_detail(campaign_id: int) -> dict[str, Any]:
+    with db() as connection:
+        row = connection.execute("SELECT * FROM review_campaigns WHERE id=?", (campaign_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Campanha não encontrada")
+        items = connection.execute("SELECT * FROM review_items WHERE campaign_id=? ORDER BY decision IS NOT NULL,privileged DESC,id",
+                                   (campaign_id,)).fetchall()
+        view = campaign_view(connection, row)
+    view["items"] = [{"id": item["id"], "identity": item["identity_name"], "identityId": item["identity_external_id"],
+                      "resource": item["resource_name"], "role": item["role_name"], "privileged": bool(item["privileged"]),
+                      "decision": item["decision"], "comment": item["comment"], "decidedBy": item["decided_by"],
+                      "decidedAt": item["decided_at"]} for item in items]
+    return view
+
+
+@app.patch("/api/reviews/{campaign_id}/items/{item_id}")
+def decide_review_item(campaign_id: int, item_id: int, payload: ReviewDecisionInput, request: Request) -> dict[str, Any]:
+    now = utc_now()
+    with db() as connection:
+        item = connection.execute("SELECT * FROM review_items WHERE id=? AND campaign_id=?", (item_id, campaign_id)).fetchone()
+        if not item:
+            raise HTTPException(404, "Item de revisão não encontrado")
+        connection.execute("UPDATE review_items SET decision=?,comment=?,decided_by=?,decided_at=? WHERE id=?",
+                           (payload.decision, payload.comment, request.state.user["email"], now, item_id))
+        if payload.decision == "keep":
+            connection.execute(
+                "UPDATE access_grants SET last_reviewed_at=? WHERE credential_id=? AND identity_external_id=? AND resource_id=? AND role_name=?",
+                (now, item["credential_id"], item["identity_external_id"], item["resource_id"], item["role_name"]))
+        elif connection.execute("SELECT id FROM credentials WHERE id=?", (item["credential_id"],)).fetchone():
+            connection.execute(
+                """INSERT INTO access_requests(credential_id,identity_external_id,resource_id,role_name,action,status,note,requested_by,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (item["credential_id"], item["identity_external_id"], item["resource_id"], item["role_name"], "revoke", "requested",
+                 payload.comment, request.state.user["email"], now))
+        decision = "mantido" if payload.decision == "keep" else "revogação solicitada"
+        audit(connection, "admin", "Decisão de revisão de acesso",
+              f"{item['identity_name']} · {item['role_name']} em {item['resource_name']}: {decision}.", request.state.user["email"],
+              action=f"review.{payload.decision}", target=f"{item['identity_name']} · {item['role_name']}",
+              details={"campaign": campaign_id, "comment": payload.comment or ""})
+        pending = connection.execute("SELECT COUNT(*) count FROM review_items WHERE campaign_id=? AND decision IS NULL",
+                                     (campaign_id,)).fetchone()["count"]
+        connection.execute("UPDATE review_campaigns SET completed_at=? WHERE id=?", (now if pending == 0 else None, campaign_id))
+    return review_detail(campaign_id)
+
+
+@app.get("/api/settings")
+def get_settings() -> dict[str, Any]:
+    with db() as connection:
+        settings = load_settings(connection)
+        credentials = connection.execute("SELECT id,last_synced_at FROM credentials").fetchall()
+    return {**settings, "nextRunAt": next_scheduled_run(settings, credentials),
+            "parameters": [{"key": key, "name": name, "description": description, "unit": unit, "min": low, "max": high,
+                            "value": settings["rules"][key]} for key, name, description, unit, low, high in RULE_PARAMETERS]}
+
+
+@app.put("/api/settings")
+def update_settings(payload: SettingsInput, request: Request) -> dict[str, Any]:
+    rules = {}
+    for key, name, _description, unit, low, high in RULE_PARAMETERS:
+        value = payload.rules.get(key, DEFAULT_SETTINGS["rules"][key])
+        if not low <= value <= high:
+            raise HTTPException(422, f"{name}: informe um valor entre {low} e {high} {unit}.")
+        rules[key] = value
+    webhook = payload.webhook.strip()
+    if webhook and not re.fullmatch(r"https://[^\s]+", webhook):
+        raise HTTPException(422, "O webhook precisa ser uma URL https://")
+    settings = {"rules": rules, "schedule": payload.schedule, "webhook": webhook,
+                "notifications": {key: bool(payload.notifications.get(key, default))
+                                  for key, default in DEFAULT_SETTINGS["notifications"].items()}}
+    with db() as connection:
+        before = load_settings(connection)
+        store_settings(connection, settings)
+        changed = sorted(key for key in rules if rules[key] != before["rules"][key])
+        audit(connection, "admin", "Configurações atualizadas",
+              f"Agendamento: {payload.schedule}. Parâmetros alterados: {', '.join(changed) or 'nenhum'}.", request.state.user["email"],
+              action="settings.updated", target="platform",
+              details={"schedule": payload.schedule, "changedRules": changed, "notifications": settings["notifications"],
+                       "webhookConfigured": bool(webhook)})
+    return get_settings()
 
 
 @app.get("/api/scans")

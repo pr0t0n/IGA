@@ -58,18 +58,24 @@ Depois acesse `http://localhost:8080`. Nesse modo a API, o login e o banco não 
 
 ## Escopo implementado nesta versão
 
-- Dashboard de postura, nota e distribuição de risco.
-- Filtro por ambiente AWS, Azure e GCP.
-- Gestão persistente de credenciais com validação sintática e por provedor.
-- Login e perfis Administrador, Analista e Auditor.
-- Gestão administrativa de usuários e bloqueio de mutações para auditores.
-- Inventários de identidades e acessos.
-- Áreas de inteligência de risco, acesso privilegiado, UEBA e compliance.
-- Regras de Access Creep, uso real, Toxic Combination, JML, contas órfãs, postura de autenticação e Access Review.
-- Auditoria filtrável e exportável em CSV.
-- Layout responsivo.
-- Motor de análise com inventários persistentes de identidades e concessões.
-- Regras para Access Creep, uso real de permissão, Toxic Combination, JML, contas órfãs, postura de autenticação, Access Review e UEBA.
+Interface única no design system **Modernist** (Archivo, grade modular, réguas de 2px, acento vermelho), com menu lateral e as telas:
+
+- **Visão geral** — nota de risco consolidada (0 = sem exposição, 100 = máxima), distribuição por severidade, risco por provedor (clique para filtrar), KPIs com variação no período, tendência de 7/30/90 dias, achados por regra, mapa de calor módulo × provedor, ambientes de maior risco, riscos prioritários, anomalias UEBA e atendimento por framework.
+- **Identidades** — KPIs (humanas, serviço, órfãs, sem MFA, inativas > 90 dias), filtros, nota de risco por identidade, painel lateral com sinais de risco e solicitação de revisão ao responsável; exportação CSV.
+- **Inventário de acessos** — concessões com origem (direta/grupo), último uso quando o provedor informa, curingas, visões por projeto (com drill-down projeto → papel → conta), por papel e por conta.
+- **Inteligência e riscos** — abas por regra com descrição e critério, filtro por severidade, ações **Remediar**, **Aceitar** (com justificativa obrigatória) e **Reabrir**; o tratamento é preservado nas análises seguintes; leitura local do Qwen.
+- **Acesso privilegiado** — permanentes × JIT, papéis de alto impacto, MFA, uso, nota de exposição, **Converter para JIT** (solicitação registrada e auditada) e dossiê com análise local.
+- **UEBA** — eventos por hora (24 h) a partir dos logs coletados, categorias (escalada de privilégio, criação de credencial, acesso negado, horário atípico), esperado × observado, **Abrir incidente** e **Marcar como comportamento esperado**; diagnóstico de cobertura de telemetria.
+- **Credenciais** — validação antes de salvar, seleção de escopos, análise automática, falha e validade da credencial.
+- **Auditoria** — trilha da plataforma encadeada por hash SHA-256 unificada aos logs dos provedores, filtros por origem e resultado, detalhe em JSON e exportação de evidências.
+- **Compliance** — ISO 27001, SOX ITGC, LGPD e CIS com status e evidência calculados das regras; **campanhas de Access Review** com decisões Manter/Revogar que recertificam a concessão; relatório CSV.
+- **Administração** — parâmetros das regras (aplicados na próxima análise), agendamento (manual, diário, 6 h, horário), notificações por webhook Slack/Teams (risco crítico novo, UEBA, credencial, resumo semanal) e usuários com convite por senha temporária.
+
+Perfis: **Administrador**, **Analista**, **Auditor** (somente leitura) e **Leitor** (somente leitura, sem trilha de auditoria).
+
+### Agendamento e notificações
+
+O agendador roda dentro da API e verifica a cada minuto as credenciais vencidas conforme a frequência escolhida em Administração (padrão: manual). Defina `SCHEDULER_ENABLED=0` para desativá-lo. O webhook precisa ser `https://` e recebe `{"text": "..."}`, formato aceito por Slack e Microsoft Teams.
 
 ## Segurança e operação
 
@@ -97,12 +103,21 @@ Endpoints de consulta:
 - `GET /api/resources`
 - `GET /api/findings`
 - `GET /api/scans`
+- `GET /api/dashboard/overview?period=7|30|90&credential_id=&provider=`
+- `GET /api/identities/summary`, `GET /api/accesses/summary`, `GET /api/privileged-access/summary`
+- `POST /api/privileged-access/{id}/jit`
+- `GET /api/ueba/overview`
+- `GET /api/audit/trail`
+- `GET /api/compliance/frameworks`
+- `GET|POST /api/reviews`, `GET /api/reviews/{id}`, `PATCH /api/reviews/{id}/items/{item}`
+- `GET|PUT /api/settings`
+- `POST /api/users/invite`
 - `GET /api/dashboard`
 - `GET /api/risk-history`
 - `GET /api/privileged-access`
 - `GET /api/ueba`
 - `GET /api/compliance`
-- `PATCH /api/findings/{id}` para resolução, aceite ou descarte auditado
+- `PATCH /api/findings/{id}` para remediação, aceite (com justificativa), incidente, resolução ou reabertura auditados
 
 Cada análise persiste a nota de postura calculada. O dashboard apresenta a evolução histórica consolidada ou filtrada por integração, permitindo comparar a postura antes e depois das remediações.
 

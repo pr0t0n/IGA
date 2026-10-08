@@ -9,6 +9,7 @@ os.environ.setdefault("CREDENTIAL_MASTER_KEY", "automated-test-master-key")
 os.environ.setdefault("JWT_SECRET", "automated-test-jwt-secret-longer-than-32-bytes")
 os.environ.setdefault("ADMIN_EMAIL", "admin@test.local")
 os.environ.setdefault("ADMIN_PASSWORD", "automated-admin-password")
+os.environ.setdefault("SCHEDULER_ENABLED", "0")
 
 from fastapi.testclient import TestClient
 
@@ -345,6 +346,140 @@ class PlatformEndToEndTest(unittest.TestCase):
         self.assertEqual(self.client.delete(f"/api/credentials/{credential_id}").status_code, 204)
         removed = next(item for item in self.client.get("/api/audit").json() if item["title"] == "Credencial removida")
         self.assertIn("Achados abertos no momento da remoção", removed["text"])
+
+
+    def test_governance_workflows(self):
+        from datetime import datetime, timedelta, timezone
+        import main as platform
+
+        now = datetime.now(timezone.utc)
+        discovery = {
+            "projects": [{"id": "111122223333", "name": "prod", "type": "account"}],
+            "identities": [
+                {"id": "alice", "name": "Alice", "type": "user", "mfaEnabled": False, "lastSeenAt": (now - timedelta(days=120)).isoformat()},
+                {"id": "builder", "name": "builder", "type": "service", "accessKeyCreatedAt": (now - timedelta(days=200)).isoformat()},
+            ],
+            "accesses": [
+                {"identityId": "alice", "resourceId": "111122223333", "resourceName": "prod", "role": "AdministratorAccess",
+                 "permissions": ["*"], "privileged": True, "lastUsedAt": (now - timedelta(days=120)).isoformat()},
+                {"identityId": "builder", "resourceId": "111122223333", "resourceName": "prod", "role": "ReadOnlyAccess",
+                 "permissions": ["arn:policy/readonly"]},
+            ],
+            "events": [
+                {"identityId": "builder", "resourceId": "111122223333", "timestamp": (now - timedelta(hours=2)).isoformat(),
+                 "method": "SetIamPolicy", "anomalous": True, "riskScore": 0.85, "description": "Operação sensível registrada: SetIamPolicy."},
+                {"identityId": "builder", "resourceId": "111122223333", "timestamp": (now - timedelta(hours=3)).isoformat(),
+                 "method": "storage.objects.get", "anomalous": False, "riskScore": 0, "description": "Atividade avaliada."},
+            ],
+        }
+        created = self.client.post("/api/credentials", json={"name": "Governance AWS", "provider": "AWS", "credential": AWS_CREDENTIAL})
+        credential_id = created.json()["id"]
+        webhook = Mock()
+        webhook.raise_for_status.return_value = None
+        settings = self.client.get("/api/settings").json()
+        self.assertEqual(settings["schedule"], "manual")
+        self.assertEqual(len(settings["parameters"]), 7)
+        self.assertEqual(self.client.put("/api/settings", json={**settings, "rules": {"unused_days": 1}}).status_code, 422)
+        saved = self.client.put("/api/settings", json={"rules": {key: item["value"] for key, item in
+                                                                 ((p["key"], p) for p in settings["parameters"])},
+                                                       "schedule": "daily", "notifications": {"critical": True, "ueba": True,
+                                                       "credential": True, "weekly": False}, "webhook": "https://hooks.example.com/abc"})
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.json()["schedule"], "daily")
+        with patch("main.discover", return_value=discovery), patch("main.requests.post", return_value=webhook) as posted:
+            self.assertEqual(self.client.post(f"/api/credentials/{credential_id}/scan").status_code, 200)
+        self.assertTrue(any(call.args[0] == "https://hooks.example.com/abc" for call in posted.call_args_list))
+        self.assertIsNotNone(self.client.get("/api/settings").json()["nextRunAt"])
+
+        overview = self.client.get(f"/api/dashboard/overview?credential_id={credential_id}&period=30").json()
+        self.assertTrue(overview["assessed"])
+        self.assertIsNotNone(overview["score"])
+        self.assertEqual(overview["kpis"]["identities"], 2)
+        self.assertEqual(overview["kpis"]["anomalies24h"], 1)
+        self.assertEqual(len(overview["frameworks"]), 4)
+        self.assertEqual(len(overview["trend"]), 1)
+        self.assertEqual(overview["environments"][0]["name"], "prod")
+        self.assertEqual(self.client.get("/api/platform/status").json()["connected"], 1)
+
+        summary = self.client.get(f"/api/identities/summary?credential_id={credential_id}").json()
+        self.assertEqual((summary["total"], summary["noMfa"], summary["inactive90"]), (2, 1, 1))
+        identities = self.client.get(f"/api/identities?credential_id={credential_id}").json()
+        self.assertGreater(identities[0]["riskScore"], 0)
+        accesses = self.client.get(f"/api/accesses/summary?credential_id={credential_id}").json()
+        self.assertEqual((accesses["total"], accesses["unused"], accesses["wildcard"]), (2, 1, 1))
+
+        findings = self.client.get(f"/api/findings?credential_id={credential_id}&finding_status=current").json()
+        rules = {item["rule"] for item in findings}
+        self.assertTrue({"PERMISSION_USAGE", "AUTHENTICATION_POSTURE", "UEBA_ANOMALY"}.issubset(rules))
+        self.assertTrue(any(item["title"] == "Chave de acesso antiga" for item in findings))
+        target = next(item for item in findings if item["rule"] == "PERMISSION_USAGE")
+        self.assertEqual(self.client.patch(f"/api/findings/{target['id']}", json={"status": "accepted"}).status_code, 422)
+        accepted = self.client.patch(f"/api/findings/{target['id']}", json={"status": "accepted", "justification": "Exceção aprovada"})
+        self.assertEqual(accepted.json()["status"], "accepted")
+        remediating = next(item for item in findings if item["title"] == "MFA não configurado")
+        self.assertEqual(self.client.patch(f"/api/findings/{remediating['id']}", json={"status": "remediating"}).status_code, 200)
+
+        privileged = self.client.get(f"/api/privileged-access?credential_id={credential_id}").json()
+        self.assertEqual(privileged[0]["model"], "Permanente")
+        jit = self.client.post(f"/api/privileged-access/{privileged[0]['id']}/jit", json={"note": "Converter via PIM"})
+        self.assertEqual(jit.json()["model"], "JIT solicitado")
+
+        with patch("main.discover", return_value=discovery), patch("main.requests.post", return_value=webhook):
+            self.assertEqual(self.client.post(f"/api/credentials/{credential_id}/scan").status_code, 200)
+        carried = {item["rule"]: item["status"] for item in self.client.get(
+            f"/api/findings?credential_id={credential_id}&finding_status=current").json() if item["rule"] in {"PERMISSION_USAGE", "AUTHENTICATION_POSTURE"} and item["title"] != "Chave de acesso antiga"}
+        self.assertEqual(carried, {"PERMISSION_USAGE": "accepted", "AUTHENTICATION_POSTURE": "remediating"})
+        self.assertEqual(self.client.get(f"/api/privileged-access/summary?credential_id={credential_id}").json()["jit"], 1)
+
+        ueba = self.client.get(f"/api/ueba/overview?credential_id={credential_id}").json()
+        self.assertEqual(len(ueba["hours"]), 24)
+        self.assertEqual(ueba["anomalies"][0]["category"], "Escalada de privilégio")
+        self.assertIn("SetIamPolicy", ueba["anomalies"][0]["observed"])
+        self.assertEqual(self.client.patch(f"/api/findings/{ueba['anomalies'][0]['id']}", json={"status": "incident"}).status_code, 200)
+
+        trail = self.client.get("/api/audit/trail").json()
+        self.assertEqual([item["name"] for item in trail["sources"]], ["Plataforma", "GCP Audit Logs", "AWS CloudTrail", "Azure Activity Log"])
+        self.assertTrue(any(item["source"] == "AWS CloudTrail" and item["action"] == "SetIamPolicy" for item in trail["events"]))
+        with sqlite3.connect(os.environ["DATABASE_PATH"]) as connection:
+            connection.row_factory = sqlite3.Row
+            chain = connection.execute("SELECT * FROM audit_events ORDER BY id").fetchall()
+        previous = None
+        for row in chain:
+            record = platform.audit_payload(row["event_type"], row["title"], row["description"], row["actor"], row["created_at"],
+                                            row["action"], row["target"], row["result"], json.loads(row["details_json"] or "{}"))
+            previous = platform.audit_record_hash(previous, record)
+            self.assertEqual(row["record_hash"], previous)
+
+        frameworks = self.client.get(f"/api/compliance/frameworks?credential_id={credential_id}").json()["frameworks"]
+        self.assertEqual([item["key"] for item in frameworks], ["iso", "sox", "lgpd", "cis"])
+        campaign = self.client.post("/api/reviews", json={"name": "Privilegiados Q4", "scope": "privileged", "credentialId": credential_id,
+                                                           "reviewer": "ciso@test.local", "dueDays": 15})
+        self.assertEqual(campaign.status_code, 201)
+        detail = self.client.get(f"/api/reviews/{campaign.json()['id']}").json()
+        self.assertEqual(detail["total"], 1)
+        decided = self.client.patch(f"/api/reviews/{detail['id']}/items/{detail['items'][0]['id']}", json={"decision": "keep"}).json()
+        self.assertEqual(decided["percent"], 100)
+        self.assertIsNotNone(decided["completedAt"])
+        self.assertIsNotNone(self.client.get(f"/api/accesses?credential_id={credential_id}").json()[1]["lastReviewedAt"] or
+                             self.client.get(f"/api/accesses?credential_id={credential_id}").json()[0]["lastReviewedAt"])
+
+        pending = self.client.post("/api/credentials", json={"name": "Never scanned", "provider": "AWS", "credential": AWS_CREDENTIAL}).json()
+        with patch("main.run_scan") as scheduled:
+            platform.scheduler_tick()
+        self.assertEqual([call.args[0] for call in scheduled.call_args_list], [pending["id"]])
+
+        invited = self.client.post("/api/users/invite", json={"email": "leitor@test.local", "role": "reader"})
+        self.assertEqual(invited.status_code, 201)
+        reader_login = self.client.post("/api/auth/login", json={"email": "leitor@test.local", "password": invited.json()["temporaryPassword"]})
+        reader = {"Authorization": f"Bearer {reader_login.json()['token']}"}
+        self.assertEqual(self.client.get("/api/dashboard/overview", headers=reader).status_code, 200)
+        self.assertEqual(self.client.get("/api/audit/trail", headers=reader).status_code, 403)
+        self.assertEqual(self.client.post("/api/reviews", headers=reader, json={}).status_code, 403)
+        self.assertEqual(self.client.put("/api/settings", headers=reader, json={}).status_code, 403)
+        self.assertIsNotNone(next(user for user in self.client.get("/api/users").json() if user["email"] == "leitor@test.local")["lastLoginAt"])
+
+        for item in (credential_id, pending["id"]):
+            self.assertEqual(self.client.delete(f"/api/credentials/{item}").status_code, 204)
 
 
 if __name__ == "__main__":

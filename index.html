@@ -7,166 +7,273 @@
   <title>Nexo IGA</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;800&family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="styles.css?v=20261007-credentials">
-  <link rel="stylesheet" href="modernist.css?v=20261007-credentials">
+  <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="modernist.css?v=20261008-platform">
 </head>
-<body data-page="dashboard">
-  <aside class="sidebar" aria-label="Navegação principal">
-    <div class="brand"><span class="brand-mark">N</span><span>Nexo<span class="muted">IGA</span></span></div>
-    <nav id="main-nav">
-      <button class="nav-item active" data-page="dashboard"><span>⌁</span> Visão geral</button>
-      <p class="nav-label">GOVERNANÇA</p>
-      <button class="nav-item" data-page="identidades"><span>◉</span> Identidades</button>
-      <button class="nav-item" data-page="projetos"><span>▦</span> Por projeto</button>
-      <button class="nav-item" data-page="roles"><span>⌘</span> Por role</button>
-      <button class="nav-item" data-page="contas"><span>◎</span> Por conta</button>
-      <button class="nav-item" data-page="acessos"><span>⇄</span> Inventário de acessos</button>
-      <button class="nav-item" data-page="riscos"><span>◇</span> Inteligência e riscos</button>
-      <button class="nav-item" data-page="privilegiados"><span>♢</span> Acesso privilegiado</button>
-      <button class="nav-item" data-page="ueba"><span>⌁</span> UEBA</button>
-      <p class="nav-label">PLATAFORMA</p>
-      <button class="nav-item" data-page="credenciais"><span>⊞</span> Credenciais</button>
-      <button class="nav-item" data-page="auditoria"><span>▤</span> Auditoria</button>
-      <button class="nav-item" data-page="compliance"><span>✓</span> Compliance</button>
-      <button class="nav-item admin-only" data-page="administracao"><span>⚙</span> Administração</button>
-    </nav>
-    <div class="sidebar-status"><span class="status-dot idle"></span><div><strong id="monitoring-status">Monitoramento não iniciado</strong><small id="last-analysis">Nenhuma análise executada</small></div></div>
-    <div class="user"><div class="avatar" id="user-avatar">AD</div><div><strong id="user-name">Administrador</strong><small id="user-role">Administrador</small></div><button id="logout" aria-label="Sair" title="Sair">↪</button></div>
-  </aside>
+<body class="locked" data-page="dashboard">
+  <div class="app">
+    <aside class="sidebar" id="sidebar" aria-label="Navegação principal">
+      <button type="button" class="sb-brand" data-nav="dashboard"><span class="sb-mark">N</span><span class="sb-name">Nexo IGA</span></button>
+      <nav class="sb-nav" id="sb-nav"></nav>
+      <div class="sb-status"><div class="sb-status-line"><span class="sb-dot idle" id="sb-dot"></span><span id="sb-status-text">Monitoramento não iniciado</span></div><div class="sb-status-sub" id="sb-status-sub">Nenhuma análise executada</div></div>
+      <div class="sb-user"><div class="sb-avatar" id="sb-avatar">A</div><div class="sb-user-info"><span class="semibold" id="sb-user-name">Administrador</span><span id="sb-user-email"></span></div><button type="button" class="sb-logout" id="logout" aria-label="Sair" title="Sair"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"></path></svg></button></div>
+    </aside>
+    <div class="scrim" id="scrim"></div>
 
-  <main>
-    <header class="topbar">
-      <div class="mobile-brand"><span class="brand-mark">N</span> Nexo IGA</div>
-      <div class="breadcrumb" id="breadcrumb" aria-label="Você está em"><span id="breadcrumb-section">Visão geral</span><span class="breadcrumb-sep" aria-hidden="true">/</span><strong id="breadcrumb-page">Postura de acesso</strong></div>
-      <div class="top-actions">
-        <label class="search"><span>⌕</span><input id="global-search" placeholder="Buscar identidade, recurso ou risco..."></label>
-        <button class="icon-btn" aria-label="Notificações">♢<span class="notification-dot"></span></button>
-        <button class="primary-btn" id="new-credential-top">+ Nova integração</button>
-      </div>
-    </header>
+    <main class="main">
+      <header class="topbar">
+        <button type="button" class="btn btn-secondary btn-icon menu-btn" id="menu-btn" aria-label="Abrir menu"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"></path></svg></button>
+        <div class="crumb" aria-label="Você está em"><span id="crumb-section">Visão geral</span><span class="crumb-sep" aria-hidden="true">/</span><strong id="crumb-page">Postura de acesso</strong></div>
+        <input class="input topbar-search" id="global-search" type="search" placeholder="Buscar identidade, recurso ou risco…" aria-label="Buscar identidade, recurso ou risco">
+        <button type="button" class="btn btn-secondary btn-icon" id="alerts-btn" aria-label="Alertas"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"></path><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"></path></svg><span class="bell-dot" id="alerts-dot" hidden></span></button>
+        <button type="button" class="btn btn-primary" id="new-credential-top"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg>Nova integração</button>
+      </header>
 
-    <section id="dashboard" class="page active">
-      <div class="page-heading">
-        <div><p class="eyebrow">VISÃO GERAL</p><h1>Postura de acesso</h1><p>Riscos e identidades consolidados em todos os seus ambientes.</p></div>
-        <div class="environment-picker"><span>DOMÍNIO / AMBIENTE</span><select id="environment-filter"><option value="all">Todos os domínios e ambientes</option></select></div>
-      </div>
-
-      <div class="hero-grid">
-        <article class="risk-score-card">
-          <div class="card-header"><div><span class="card-kicker">NOTA DE POSTURA</span><h2>Postura geral</h2></div><span id="risk-trend" class="trend good">Sem dados</span></div>
-          <div class="score-content">
-            <div class="score-ring score-empty"><div><strong id="risk-score">0</strong><span>/100</span></div></div>
-            <div class="score-copy"><span id="risk-label" class="risk-label">SEM DADOS</span><p id="risk-summary">Nenhum ambiente conectado. Adicione uma credencial para iniciar a análise.</p><button class="text-btn" data-go="credenciais">Adicionar credencial →</button></div>
+      <!-- Visão geral -->
+      <section id="dashboard" class="page active" aria-labelledby="dashboard-title">
+        <div class="page-head">
+          <div class="page-head-copy"><div class="eyebrow">Visão geral</div><h1 id="dashboard-title">Postura de acesso</h1><div class="lead" id="dash-summary">Carregando…</div></div>
+          <div class="head-actions">
+            <div class="field"><label for="dash-env">Domínio / floresta / ambiente</label><select class="input strong" id="dash-env"><option value="all">Todos os domínios e ambientes</option></select></div>
+            <div class="seg" role="radiogroup" aria-label="Período">
+              <label class="seg-opt"><input type="radio" name="dash-period" value="7">7 dias</label>
+              <label class="seg-opt"><input type="radio" name="dash-period" value="30">30 dias</label>
+              <label class="seg-opt"><input type="radio" name="dash-period" value="90" checked>90 dias</label>
+            </div>
           </div>
-        </article>
-        <article class="environment-card">
-          <div class="card-header"><div><span class="card-kicker">AMBIENTE</span><h2>Distribuição de risco</h2></div><button class="more-btn">•••</button></div>
-          <div class="risk-bars">
-            <div><span>Crítico</span><div class="bar"><i id="bar-critical" class="critical width-0"></i></div><strong id="count-critical">0</strong></div>
-            <div><span>Alto</span><div class="bar"><i id="bar-high" class="high width-0"></i></div><strong id="count-high">0</strong></div>
-            <div><span>Médio</span><div class="bar"><i id="bar-medium" class="medium width-0"></i></div><strong id="count-medium">0</strong></div>
-            <div><span>Baixo</span><div class="bar"><i id="bar-low" class="low width-0"></i></div><strong id="count-low">0</strong></div>
-          </div>
-          <div class="risk-total"><span>Riscos ativos</span><strong id="active-risk-count">0</strong><small id="environment-count">em 0 ambientes conectados</small></div>
-        </article>
-      </div>
-
-      <div class="metrics-grid">
-        <article class="metric"><div class="metric-icon blue">◉</div><div><span>Identidades</span><strong id="metric-identities">0</strong><small>inventário normalizado</small></div></article>
-        <article class="metric"><div class="metric-icon violet">⇄</div><div><span>Acessos</span><strong id="metric-accesses">0</strong><small>concessões analisadas</small></div></article>
-        <article class="metric"><div class="metric-icon amber">♢</div><div><span>Acessos privilegiados</span><strong id="metric-privileged">0</strong><small>funções de alto impacto</small></div></article>
-        <article class="metric"><div class="metric-icon teal">✓</div><div><span>Conformidade</span><strong id="metric-compliance">0%</strong><small>controles avaliados</small></div></article>
-      </div>
-
-      <article class="panel history-panel">
-        <div class="card-header"><div><span class="card-kicker">EVOLUÇÃO</span><h2>Tendência da postura de risco</h2></div><span id="history-caption" class="trend good">Aguardando análises</span></div>
-        <div id="risk-history-chart" class="trend-chart" aria-label="Histórico da nota de risco"></div>
-      </article>
-
-      <div class="content-grid">
-        <article class="panel risk-panel">
-          <div class="card-header"><div><span class="card-kicker">PRIORIDADES</span><h2>Riscos que exigem ação</h2></div><button class="text-btn" data-go="riscos">Ver todos →</button></div>
-          <div id="priority-risks" class="risk-list"></div>
-        </article>
-        <article class="panel">
-          <div class="card-header"><div><span class="card-kicker">COBERTURA</span><h2>Ambientes conectados</h2></div><button class="add-small" id="new-credential-card">+</button></div>
-          <div id="cloud-summary" class="cloud-list"></div>
-        </article>
-      </div>
-    </section>
-
-    <section id="credenciais" class="page ds" aria-labelledby="credenciais-title">
-      <div class="ds-head">
-        <div class="ds-head-copy">
-          <div class="ds-eyebrow">Integrações</div>
-          <h1 id="credenciais-title">Credenciais de acesso</h1>
-          <div class="ds-lead">Conecte contas GCP, AWS ou Azure com uma credencial JSON. A plataforma analisa o acesso e descobre os projetos, contas e assinaturas visíveis.</div>
         </div>
-        <button type="button" class="btn btn-primary" id="new-credential-page"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg>Adicionar credencial</button>
-      </div>
+        <div id="dash-body"></div>
+      </section>
 
-      <div class="ds-stats" id="credential-stats" aria-live="polite"></div>
-
-      <div class="ds-grid">
-        <section class="ds-cell ds-cell-main" aria-labelledby="credential-list-title">
-          <div class="ds-cell-head"><div class="card-kicker">Conectadas</div><div class="card-title" id="credential-list-title">Credenciais cadastradas</div></div>
-          <div class="ds-empty" id="credential-empty" hidden>
-            <div class="ds-empty-title">Nenhuma credencial cadastrada</div>
-            <div class="ds-empty-text">Adicione uma credencial para iniciar a análise de identidades e acessos.</div>
-            <button type="button" class="btn btn-primary" id="new-credential-empty">Adicionar credencial</button>
+      <!-- Identidades -->
+      <section id="identidades" class="page" aria-labelledby="identidades-title">
+        <div class="page-head">
+          <div class="page-head-copy"><div class="eyebrow">Identity Inventory</div><h1 id="identidades-title">Identidades</h1><div class="lead">Identidades humanas e de serviço normalizadas a partir de GCP, AWS e Azure, com acessos e sinais de risco correlacionados.</div></div>
+          <div class="head-actions"><button type="button" class="btn btn-secondary" id="id-export">Exportar CSV</button><button type="button" class="btn btn-primary mutating" data-new-review="all">Iniciar Access Review</button></div>
+        </div>
+        <div class="band top stats" id="id-kpis"></div>
+        <div class="filters">
+          <div class="seg" role="radiogroup" aria-label="Tipo de identidade" id="id-types">
+            <label class="seg-opt"><input type="radio" name="id-type" value="all" checked>Todas</label>
+            <label class="seg-opt"><input type="radio" name="id-type" value="user">Humanas</label>
+            <label class="seg-opt"><input type="radio" name="id-type" value="service">Serviço</label>
+            <label class="seg-opt"><input type="radio" name="id-type" value="orphan">Órfãs</label>
+            <label class="seg-opt"><input type="radio" name="id-type" value="leaver">Desligadas</label>
           </div>
-          <div id="credential-list"></div>
+          <select class="input w180" id="id-provider" aria-label="Provedor"><option value="all">Todos os provedores</option><option value="GCP">GCP</option><option value="AWS">AWS</option><option value="Azure">Azure</option></select>
+          <input class="input grow" id="id-search" type="search" placeholder="Buscar por nome, e-mail ou ID" aria-label="Buscar identidades">
+          <span class="count-text" id="id-count"></span>
+        </div>
+        <div class="band">
+          <section class="cell flush" data-flex="2 1 620px"><div class="table-wrap"><table class="table min-760"><thead><tr><th>Identidade</th><th>Tipo</th><th>Provedor</th><th>Ambiente</th><th class="right">Acessos</th><th>Risco</th><th>Ciclo de vida</th><th>Último login</th></tr></thead><tbody id="id-rows"></tbody></table></div></section>
+          <aside class="cell gap-16" data-flex="1 1 320px" id="id-aside" hidden></aside>
+        </div>
+      </section>
+
+      <!-- Inventário de acessos -->
+      <section id="acessos" class="page" aria-labelledby="acessos-title">
+        <div class="page-head">
+          <div class="page-head-copy"><div class="eyebrow">Access Inventory</div><h1 id="acessos-title">Inventário de acessos</h1><div class="lead">Todas as concessões (quem acessa o quê, por qual caminho) com o uso real de cada permissão quando o provedor o informa.</div></div>
+          <div class="head-actions"><button type="button" class="btn btn-secondary" id="acc-export">Exportar CSV</button></div>
+        </div>
+        <div class="band top stats" id="acc-kpis"></div>
+        <div class="filters">
+          <div class="seg" role="radiogroup" aria-label="Visão">
+            <label class="seg-opt"><input type="radio" name="acc-view" value="grants" checked>Concessões</label>
+            <label class="seg-opt"><input type="radio" name="acc-view" value="projects">Por projeto</label>
+            <label class="seg-opt"><input type="radio" name="acc-view" value="roles">Por papel</label>
+            <label class="seg-opt"><input type="radio" name="acc-view" value="accounts">Por conta</label>
+          </div>
+          <div class="seg" role="radiogroup" aria-label="Provedor">
+            <label class="seg-opt"><input type="radio" name="acc-prov" value="all" checked>Todos</label>
+            <label class="seg-opt"><input type="radio" name="acc-prov" value="GCP">GCP</label>
+            <label class="seg-opt"><input type="radio" name="acc-prov" value="AWS">AWS</label>
+            <label class="seg-opt"><input type="radio" name="acc-prov" value="Azure">Azure</label>
+          </div>
+          <label class="check" id="acc-unused-label"><input type="checkbox" id="acc-unused"><span id="acc-unused-text">Somente sem uso há mais de 90 dias</span></label>
+          <input class="input grow" id="acc-search" type="search" placeholder="Buscar identidade, recurso ou papel" aria-label="Buscar concessões">
+        </div>
+        <div class="band">
+          <section class="cell flush" data-flex="2.4 1 640px"><div class="table-wrap" id="acc-table"></div><div class="foot-text" id="acc-foot"></div></section>
+          <section class="cell gap-24" data-flex="1 1 280px" id="acc-side"></section>
+        </div>
+      </section>
+
+      <!-- Inteligência e riscos -->
+      <section id="riscos" class="page" aria-labelledby="riscos-title">
+        <div class="page-head">
+          <div class="page-head-copy"><div class="eyebrow">Access Intelligence · Access Risk</div><h1 id="riscos-title">Inteligência e riscos</h1><div class="lead">Achados das regras de validação, priorizados por severidade. Remedie, aceite ou reabra cada risco com trilha de auditoria.</div></div>
+          <div class="sev-counters" id="risk-sevs"></div>
+        </div>
+        <div class="tabs" id="risk-tabs" role="tablist" aria-label="Regras"></div>
+        <div class="rule-info" id="risk-rule"></div>
+        <section class="cell flush"><div class="table-wrap"><table class="table min-900"><thead><tr><th>Severidade</th><th>Achado</th><th>Identidade</th><th>Ambiente</th><th>Regra</th><th>Detectado</th><th>Status</th><th class="right">Ação</th></tr></thead><tbody id="risk-rows"></tbody></table></div><div class="foot-text" id="risk-foot"></div></section>
+        <section class="cell gap-12 flush" id="risk-ai"></section>
+      </section>
+
+      <!-- Acesso privilegiado -->
+      <section id="privilegiados" class="page" aria-labelledby="privilegiados-title">
+        <div class="page-head">
+          <div class="page-head-copy"><div class="eyebrow">Privileged Access</div><h1 id="privilegiados-title">Acesso privilegiado</h1><div class="lead">Identidades com papéis de alto impacto. Reduza o acesso permanente solicitando a conversão para just-in-time (JIT).</div></div>
+        </div>
+        <div class="band top stats" id="priv-kpis"></div>
+        <div class="band">
+          <section class="cell gap-12" data-flex="1 1 320px" id="priv-roles"></section>
+          <section class="cell gap-12" data-flex="2.4 1 620px">
+            <div class="cell-head"><div><div class="card-kicker">Contas</div><div class="card-title">Contas privilegiadas por risco</div></div><label class="check"><input type="checkbox" id="priv-standing">Somente acesso permanente</label></div>
+            <div class="table-wrap"><table class="table min-760"><thead><tr><th>Identidade</th><th>Papel</th><th>Escopo</th><th>Modelo</th><th>MFA</th><th>Último uso</th><th class="right">Risco</th><th></th></tr></thead><tbody id="priv-rows"></tbody></table></div>
+            <div class="foot-text" id="priv-foot"></div>
+          </section>
+        </div>
+      </section>
+
+      <!-- UEBA -->
+      <section id="ueba" class="page" aria-labelledby="ueba-title">
+        <div class="page-head">
+          <div class="page-head-copy"><div class="eyebrow">User &amp; Entity Behavior Analytics</div><h1 id="ueba-title">Anomalias de acesso</h1><div class="lead">Desvios do comportamento de cada identidade identificados nos logs de auditoria dos provedores conectados.</div></div>
+        </div>
+        <div class="band top stats" id="ueba-kpis"></div>
+        <div class="band">
+          <section class="cell" data-flex="2 1 520px">
+            <div class="cell-head"><div><div class="card-kicker">Últimas 24 h</div><div class="card-title">Eventos de acesso por hora</div></div><div class="legend"><span><i class="gray"></i>Normal</span><span><i class="red"></i>Com anomalia</span></div></div>
+            <div class="hours" id="ueba-hours"></div>
+            <div class="hours-x" id="ueba-hours-x"></div>
+          </section>
+          <section class="cell gap-10" data-flex="1 1 280px" id="ueba-cats"></section>
+        </div>
+        <div class="band" id="ueba-coverage-band" hidden><section class="cell gap-10" id="ueba-coverage"></section></div>
+        <div class="band">
+          <section class="cell gap-6" data-flex="2 1 560px" id="ueba-list"></section>
+          <aside class="cell" data-flex="1 1 320px" id="ueba-aside" hidden></aside>
+        </div>
+      </section>
+
+      <!-- Credenciais -->
+      <section id="credenciais" class="page" aria-labelledby="credenciais-title">
+        <div class="page-head">
+          <div class="page-head-copy"><div class="eyebrow">Integrações</div><h1 id="credenciais-title">Credenciais de acesso</h1><div class="lead">Conecte contas GCP, AWS ou Azure com uma credencial JSON. A plataforma analisa o acesso e descobre os projetos, contas e assinaturas visíveis.</div></div>
+          <button type="button" class="btn btn-primary mutating" id="new-credential-page"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg>Adicionar credencial</button>
+        </div>
+        <div class="band top stats" id="credential-stats" aria-live="polite"></div>
+        <div class="band">
+          <section class="cell gap-6" data-flex="2.2 1 600px" aria-labelledby="credential-list-title">
+            <div class="cell-head"><div><div class="card-kicker">Conectadas</div><div class="card-title" id="credential-list-title">Credenciais cadastradas</div></div></div>
+            <div class="cred-empty" id="credential-empty" hidden>
+              <b>Nenhuma credencial cadastrada</b>
+              <div class="muted">Adicione uma credencial para iniciar a análise de identidades e acessos.</div>
+              <button type="button" class="btn btn-primary mutating" id="new-credential-empty">Adicionar credencial</button>
+            </div>
+            <div id="credential-list"></div>
+          </section>
+          <section class="cell gap-16" data-flex="1 1 300px" aria-labelledby="credential-requirements-title">
+            <div><div class="card-kicker">Requisitos</div><div class="card-title" id="credential-requirements-title">Permissões mínimas de leitura</div></div>
+            <div id="credential-requirements"></div>
+            <div class="note">A plataforma só lê dados. As chaves são cifradas em repouso e nunca voltam a ser exibidas.</div>
+          </section>
+        </div>
+      </section>
+
+      <!-- Auditoria -->
+      <section id="auditoria" class="page" aria-labelledby="auditoria-title">
+        <div class="page-head">
+          <div class="page-head-copy"><div class="eyebrow">Trilha de auditoria</div><h1 id="auditoria-title">Auditoria</h1><div class="lead">Eventos da plataforma e dos provedores. Os registros da plataforma são encadeados por hash SHA-256 e não podem ser alterados.</div></div>
+          <button type="button" class="btn btn-secondary" id="audit-export">Exportar evidências (CSV)</button>
+        </div>
+        <div class="band top stats" id="audit-sources"></div>
+        <div class="filters">
+          <div class="seg" role="radiogroup" aria-label="Resultado">
+            <label class="seg-opt"><input type="radio" name="audit-result" value="all" checked>Todos</label>
+            <label class="seg-opt"><input type="radio" name="audit-result" value="ok">Sucesso</label>
+            <label class="seg-opt"><input type="radio" name="audit-result" value="fail">Falha / bloqueio</label>
+          </div>
+          <input class="input grow" id="audit-search" type="search" placeholder="Buscar ator, ação ou alvo" aria-label="Buscar eventos">
+          <span class="count-text" id="audit-count"></span>
+        </div>
+        <div class="band">
+          <section class="cell flush" data-flex="2 1 600px"><div class="table-wrap"><table class="table min-720"><thead><tr><th>Data / hora</th><th>Ator</th><th>Ação</th><th>Alvo</th><th>Origem</th><th>Resultado</th></tr></thead><tbody id="audit-rows"></tbody></table></div></section>
+          <aside class="cell gap-12" data-flex="1 1 320px" id="audit-aside" hidden></aside>
+        </div>
+      </section>
+
+      <!-- Compliance -->
+      <section id="compliance" class="page" aria-labelledby="compliance-title">
+        <div class="page-head">
+          <div class="page-head-copy"><div class="eyebrow">Compliance Audit</div><h1 id="compliance-title">Compliance</h1><div class="lead">Controles de identidade e acesso mapeados para cada framework, com evidência gerada automaticamente pelas regras.</div></div>
+          <button type="button" class="btn btn-secondary" id="comp-report">Gerar relatório de auditoria</button>
+        </div>
+        <div class="band top" id="comp-fws"></div>
+        <div class="band">
+          <section class="cell gap-12" data-flex="2 1 600px" id="comp-controls"></section>
+          <section class="cell" data-flex="1 1 320px">
+            <div class="cell-head"><div><div class="card-kicker">Access Review</div><div class="card-title">Campanhas de revisão</div></div><button type="button" class="btn btn-primary mutating" data-new-review="privileged">Nova campanha</button></div>
+            <div id="comp-camps" class="stack-12"></div>
+          </section>
+        </div>
+      </section>
+
+      <!-- Administração -->
+      <section id="administracao" class="page" aria-labelledby="administracao-title">
+        <div class="page-head">
+          <div class="page-head-copy"><div class="eyebrow">Configurações</div><h1 id="administracao-title">Administração</h1><div class="lead">Usuários da plataforma, parâmetros das regras de validação, agendamento da análise e notificações.</div></div>
+          <button type="button" class="btn btn-primary" id="settings-save">Salvar alterações</button>
+        </div>
+        <div class="band top">
+          <section class="cell gap-12" data-flex="1.4 1 480px"><div><div class="card-kicker">Regras de validação</div><div class="card-title">Parâmetros</div></div><div id="settings-params"></div></section>
+          <section class="cell gap-20" data-flex="1 1 320px">
+            <div class="stack-10">
+              <div><div class="card-kicker">Análise</div><div class="card-title">Agendamento</div></div>
+              <div class="seg" role="radiogroup" aria-label="Frequência da análise">
+                <label class="seg-opt"><input type="radio" name="schedule" value="manual">Manual</label>
+                <label class="seg-opt"><input type="radio" name="schedule" value="daily">Diária</label>
+                <label class="seg-opt"><input type="radio" name="schedule" value="6h">A cada 6 h</label>
+                <label class="seg-opt"><input type="radio" name="schedule" value="hourly">Horária</label>
+              </div>
+              <div class="muted-sm" id="settings-next"></div>
+            </div>
+            <div class="stack-10 divider-top">
+              <div class="card-title">Notificações</div>
+              <label class="notif"><input type="checkbox" class="checkbox" data-notif="critical"><span><b>Novo risco crítico</b><small>Enviada ao detectar um risco crítico que não existia na análise anterior</small></span></label>
+              <label class="notif"><input type="checkbox" class="checkbox" data-notif="ueba"><span><b>Anomalia UEBA acima do limite</b><small>Desvio acima da pontuação mínima configurada</small></span></label>
+              <label class="notif"><input type="checkbox" class="checkbox" data-notif="credential"><span><b>Credencial expirando ou com falha</b><small>7 dias antes do vencimento ou na falha da análise</small></span></label>
+              <label class="notif"><input type="checkbox" class="checkbox" data-notif="weekly"><span><b>Resumo semanal</b><small>Nota de risco, riscos ativos e novos no webhook</small></span></label>
+              <div class="field"><label for="settings-webhook">Webhook (Slack / Teams)</label><input class="input" id="settings-webhook" type="url" placeholder="https://hooks.slack.com/services/…" autocomplete="off"></div>
+            </div>
+          </section>
+        </div>
+        <section class="section-flat">
+          <div class="cell-head">
+            <div><div class="card-kicker">Acesso à plataforma</div><div class="card-title">Usuários</div></div>
+            <div class="invite-row">
+              <input class="input email" id="invite-email" type="email" placeholder="e-mail@empresa.com.br" aria-label="E-mail do convidado">
+              <select class="input role" id="invite-role" aria-label="Papel"><option value="analyst">Analista</option><option value="auditor">Auditor</option><option value="reader">Leitor</option><option value="admin">Administrador</option></select>
+              <button type="button" class="btn btn-secondary" id="invite-btn" disabled>Convidar</button>
+            </div>
+          </div>
+          <div class="table-wrap"><table class="table min-640"><thead><tr><th>Nome</th><th>E-mail</th><th>Papel</th><th>Status</th><th>Último acesso</th><th></th></tr></thead><tbody id="users-rows"></tbody></table></div>
         </section>
-        <section class="ds-cell ds-cell-side" aria-labelledby="credential-requirements-title">
-          <div><div class="card-kicker">Requisitos</div><div class="card-title" id="credential-requirements-title">Permissões mínimas de leitura</div></div>
-          <div id="credential-requirements"></div>
-          <div class="ds-note">A plataforma só lê dados. As chaves são cifradas em repouso e nunca voltam a ser exibidas.</div>
-        </section>
-      </div>
-    </section>
+      </section>
+    </main>
+  </div>
 
-    <section id="auditoria" class="page">
-      <div class="page-heading"><div><p class="eyebrow">TRILHA IMUTÁVEL</p><h1>Auditoria</h1><p>Mudanças de postura administrativa, credenciais e riscos.</p></div><button class="secondary-btn" id="export-audit">⇩ Exportar CSV</button></div>
-      <div class="audit-filters"><button class="chip active" data-audit="all">Todos</button><button class="chip" data-audit="admin">Administrativo</button><button class="chip" data-audit="risk">Riscos</button><button class="chip" data-audit="credential">Credenciais</button></div>
-      <div class="timeline" id="audit-timeline"></div>
-    </section>
-
-    <section id="riscos" class="page module-page"></section>
-    <section id="identidades" class="page module-page"></section>
-    <section id="projetos" class="page module-page"></section>
-    <section id="roles" class="page module-page"></section>
-    <section id="contas" class="page module-page"></section>
-    <section id="acessos" class="page module-page"></section>
-    <section id="privilegiados" class="page module-page"></section>
-    <section id="ueba" class="page module-page"></section>
-    <section id="compliance" class="page module-page"></section>
-    <section id="administracao" class="page">
-      <div class="page-heading"><div><p class="eyebrow">CONTROLE DE ACESSO</p><h1>Administração</h1><p>Gerencie usuários e perfis de acesso à plataforma.</p></div><button class="primary-btn" id="new-user">+ Novo usuário</button></div>
-      <div class="access-role-grid">
-        <article class="rule-card"><span>ADMIN</span><h3>Administrador</h3><p>Gerencia usuários, credenciais, análises e riscos.</p></article>
-        <article class="rule-card"><span>ANALYST</span><h3>Analista</h3><p>Opera integrações, análises e tratamento de riscos.</p></article>
-        <article class="rule-card"><span>AUDITOR</span><h3>Auditor</h3><p>Consulta inventários, conformidade e trilhas sem alterar dados.</p></article>
-      </div>
-      <div class="table-panel"><div class="table-tools"><strong>Usuários da plataforma</strong><span id="user-count"></span></div><div class="table-wrap"><table><thead><tr><th>Usuário</th><th>E-mail</th><th>Perfil</th><th>Status</th><th></th></tr></thead><tbody id="users-body"></tbody></table></div></div>
-    </section>
-  </main>
-
+  <!-- Login -->
   <div id="login-screen" class="login-screen">
     <form id="login-form" class="login-card">
-      <div class="brand login-brand"><span class="brand-mark">N</span><span>Nexo IGA</span></div>
-      <p class="eyebrow">ACESSO SEGURO</p><h1>Entre na plataforma</h1><p>Use sua conta administrativa ou corporativa.</p>
-      <label>E-mail<input id="login-email" type="email" autocomplete="username" required placeholder="admin@empresa.com"></label>
-      <label>Senha<input id="login-password" type="password" autocomplete="current-password" required minlength="8" placeholder="Sua senha"></label>
-      <div id="login-feedback" class="json-feedback error"></div>
-      <button class="primary-btn login-submit" type="submit">Entrar</button>
+      <div class="login-brand"><span class="sb-mark">N</span><span class="sb-name">Nexo IGA</span></div>
+      <div class="eyebrow">Acesso seguro</div>
+      <h1>Entre na plataforma</h1>
+      <div class="lead">Use sua conta administrativa ou corporativa.</div>
+      <div class="field"><label for="login-email">E-mail</label><input class="input" id="login-email" type="email" autocomplete="username" required placeholder="admin@empresa.com"></div>
+      <div class="field"><label for="login-password">Senha</label><input class="input" id="login-password" type="password" autocomplete="current-password" required minlength="8" placeholder="Sua senha"></div>
+      <div class="alert" id="login-feedback" role="alert" hidden></div>
+      <button class="btn btn-primary" type="submit">Entrar</button>
     </form>
   </div>
 
-  <dialog id="credential-modal" class="ds ds-dialog" aria-labelledby="credential-modal-title">
-    <div class="ds-dialog-head">
+  <!-- Credencial: adicionar / editar -->
+  <dialog id="credential-modal" class="dialog" aria-labelledby="credential-modal-title">
+    <div class="dialog-head">
       <div class="dialog-title" id="credential-modal-title">Nova credencial</div>
-      <button type="button" class="btn btn-icon" aria-label="Fechar" data-close-credential><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"></path></svg></button>
+      <button type="button" class="btn btn-icon" aria-label="Fechar" data-close><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"></path></svg></button>
     </div>
     <div class="field">
       <label id="credential-provider-label">Provedor</label>
@@ -178,49 +285,83 @@
     </div>
     <div class="field"><label for="credential-name">Nome da integração</label><input class="input" id="credential-name" maxlength="100" autocomplete="off" placeholder="ex.: org-producao-leitura"></div>
     <div class="field">
-      <div class="ds-field-row"><label for="credential-json">Credencial (JSON)</label><button type="button" class="btn btn-ghost ds-btn-xs" id="credential-sample">Inserir exemplo</button></div>
-      <textarea class="input ds-json" id="credential-json" spellcheck="false" autocomplete="off" aria-describedby="credential-json-hint"></textarea>
-      <div class="ds-hint" id="credential-json-hint"></div>
+      <div class="field-row"><label for="credential-json">Credencial (JSON)</label><button type="button" class="btn btn-ghost btn-xs" id="credential-sample">Inserir exemplo</button></div>
+      <textarea class="input json-input" id="credential-json" spellcheck="false" autocomplete="off" aria-describedby="credential-json-hint"></textarea>
+      <div class="hint" id="credential-json-hint"></div>
     </div>
-    <div class="ds-alert" id="credential-error" role="alert" hidden></div>
-    <div class="ds-validated" id="credential-validated" hidden></div>
+    <div class="alert" id="credential-error" role="alert" hidden></div>
+    <div class="validated" id="credential-validated" hidden></div>
     <div class="dialog-actions">
-      <button type="button" class="btn btn-secondary" data-close-credential>Cancelar</button>
+      <button type="button" class="btn btn-secondary" data-close>Cancelar</button>
       <button type="button" class="btn btn-secondary" id="credential-validate">Validar credencial</button>
       <button type="button" class="btn btn-primary" id="credential-save" disabled>Salvar integração</button>
     </div>
   </dialog>
-  <dialog id="credential-remove-modal" class="ds ds-dialog ds-dialog-sm" aria-labelledby="credential-remove-title">
-    <div class="dialog-title" id="credential-remove-title">Remover credencial?</div>
-    <div class="dialog-body" id="credential-remove-text"></div>
-    <div class="dialog-actions">
-      <button type="button" class="btn btn-secondary" data-close-remove>Cancelar</button>
-      <button type="button" class="btn btn-primary" id="credential-remove-confirm">Remover credencial</button>
+
+  <!-- Confirmação genérica -->
+  <dialog id="confirm-modal" class="dialog dialog-sm" aria-labelledby="confirm-title">
+    <div class="dialog-title" id="confirm-title"></div>
+    <div class="dialog-body" id="confirm-text"></div>
+    <div class="dialog-actions"><button type="button" class="btn btn-secondary" data-close>Cancelar</button><button type="button" class="btn btn-primary" id="confirm-ok"></button></div>
+  </dialog>
+
+  <!-- Justificativa (aceite de risco, comportamento esperado) -->
+  <dialog id="justify-modal" class="dialog dialog-sm" aria-labelledby="justify-title">
+    <div class="dialog-title" id="justify-title"></div>
+    <div class="dialog-body" id="justify-text"></div>
+    <div class="field"><label for="justify-input">Justificativa (registrada na auditoria)</label><textarea class="input" id="justify-input" maxlength="500" placeholder="ex.: exceção aprovada pelo CISO até 31/12, ticket SEC-2291"></textarea></div>
+    <div class="alert" id="justify-error" role="alert" hidden></div>
+    <div class="dialog-actions"><button type="button" class="btn btn-secondary" data-close>Cancelar</button><button type="button" class="btn btn-primary" id="justify-ok">Confirmar</button></div>
+  </dialog>
+
+  <!-- Nova campanha de revisão -->
+  <dialog id="review-new-modal" class="dialog" aria-labelledby="review-new-title">
+    <div class="dialog-head"><div class="dialog-title" id="review-new-title">Nova campanha de revisão</div><button type="button" class="btn btn-icon" aria-label="Fechar" data-close><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"></path></svg></button></div>
+    <div class="field"><label for="review-name">Nome da campanha</label><input class="input" id="review-name" maxlength="150"></div>
+    <div class="field">
+      <label id="review-scope-label">Escopo</label>
+      <div class="seg" role="radiogroup" aria-labelledby="review-scope-label" id="review-scopes">
+        <label class="seg-opt"><input type="radio" name="review-scope" value="privileged" checked>Acessos privilegiados</label>
+        <label class="seg-opt"><input type="radio" name="review-scope" value="unused">Sem uso</label>
+        <label class="seg-opt"><input type="radio" name="review-scope" value="all">Todas as concessões</label>
+        <label class="seg-opt" id="review-scope-identity" hidden><input type="radio" name="review-scope" value="identity">Identidade</label>
+      </div>
     </div>
+    <div class="field"><label for="review-env">Ambiente</label><select class="input" id="review-env"></select></div>
+    <div class="field"><label for="review-reviewer">Revisor responsável</label><input class="input" id="review-reviewer" maxlength="150" placeholder="ex.: gestor@empresa.com.br"></div>
+    <div class="field"><label for="review-due">Prazo (dias)</label><input class="input" id="review-due" type="number" min="1" max="365" value="30"></div>
+    <div class="alert" id="review-new-error" role="alert" hidden></div>
+    <div class="dialog-actions"><button type="button" class="btn btn-secondary" data-close>Cancelar</button><button type="button" class="btn btn-primary" id="review-create">Criar campanha</button></div>
   </dialog>
-  <dialog id="user-modal">
-    <form id="user-form" method="dialog">
-      <div class="modal-header"><div><p class="eyebrow">GESTÃO DE ACESSO</p><h2>Novo usuário</h2></div><button type="button" class="close-btn" id="close-user-modal">×</button></div>
-      <label>Nome<input id="new-user-name" required minlength="2"></label>
-      <label>E-mail<input id="new-user-email" type="email" required></label>
-      <div class="form-grid"><label>Perfil<select id="new-user-role"><option value="analyst">Analista</option><option value="auditor">Auditor</option><option value="admin">Administrador</option></select></label><label>Senha inicial<input id="new-user-password" type="password" required minlength="8"></label></div>
-      <div id="user-feedback" class="json-feedback error"></div>
-      <div class="modal-actions"><button type="button" class="secondary-btn" id="cancel-user-modal">Cancelar</button><button type="submit" class="primary-btn">Criar usuário</button></div>
-    </form>
+
+  <!-- Campanha: decisões -->
+  <dialog id="review-modal" class="dialog dialog-lg" aria-labelledby="review-title">
+    <div class="dialog-head"><div><div class="card-kicker" id="review-kicker"></div><div class="dialog-title" id="review-title"></div><div class="muted-sm" id="review-meta"></div></div><button type="button" class="btn btn-icon" aria-label="Fechar" data-close><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"></path></svg></button></div>
+    <div class="review-list" id="review-items"></div>
   </dialog>
-  <dialog id="privilege-modal" class="wide-modal">
-    <div class="modal-header"><div><p class="eyebrow">PRIVILEGED ACCESS INTELLIGENCE</p><h2>Dossiê do acesso</h2></div><button type="button" class="close-btn" id="close-privilege-modal">×</button></div>
-    <div id="privilege-content"></div>
+
+  <!-- Dossiê de acesso privilegiado (análise local Qwen) -->
+  <dialog id="dossier-modal" class="dialog dialog-lg" aria-labelledby="dossier-title">
+    <div class="dialog-head"><div><div class="card-kicker">Privileged Access Intelligence</div><div class="dialog-title" id="dossier-title">Dossiê do acesso</div></div><button type="button" class="btn btn-icon" aria-label="Fechar" data-close><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"></path></svg></button></div>
+    <div id="dossier-content" class="stack-12"></div>
   </dialog>
-  <dialog id="identity-modal" class="wide-modal">
-    <div class="modal-header"><div><p class="eyebrow">IDENTITY INVENTORY</p><h2>Dossiê da identidade</h2></div><button type="button" class="close-btn" id="close-identity-modal">×</button></div>
-    <div id="identity-content"></div>
+
+  <!-- Projeto → papel → conta -->
+  <dialog id="project-modal" class="dialog dialog-lg" aria-labelledby="project-title">
+    <div class="dialog-head"><div><div class="card-kicker">Caminho de acesso</div><div class="dialog-title" id="project-title">Projeto</div></div><button type="button" class="btn btn-icon" aria-label="Fechar" data-close><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"></path></svg></button></div>
+    <div id="project-content" class="stack-12"></div>
   </dialog>
-  <dialog id="project-modal" class="wide-modal">
-    <div class="modal-header"><div><p class="eyebrow">PROJECT ACCESS PATH</p><h2>Projeto → Role → Conta</h2></div><button type="button" class="close-btn" id="close-project-modal">×</button></div>
-    <div id="project-content"></div>
+
+  <!-- Convite: senha temporária -->
+  <dialog id="invite-modal" class="dialog dialog-sm" aria-labelledby="invite-title">
+    <div class="dialog-title" id="invite-title">Convite criado</div>
+    <div class="dialog-body" id="invite-text"></div>
+    <div class="secret" id="invite-secret"></div>
+    <div class="note">A senha temporária é exibida uma única vez. Compartilhe por um canal seguro.</div>
+    <div class="dialog-actions"><button type="button" class="btn btn-secondary" id="invite-copy">Copiar senha</button><button type="button" class="btn btn-primary" data-close>Concluir</button></div>
   </dialog>
+
   <div id="toast" role="status" aria-live="polite"></div>
-  <script src="app.js?v=20261007-credentials"></script>
+  <script src="app.js?v=20261008-platform"></script>
 </body>
 </html>
