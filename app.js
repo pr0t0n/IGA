@@ -57,7 +57,8 @@ const RESOURCE_LABEL = { project: 'Projeto', account: 'Conta', subscription: 'As
 const SCOPE_KIND = { GCP: 'Projeto', AWS: 'Conta', Azure: 'Assinatura' };
 const STATUS_LABEL = { open: 'Aberto', remediating: 'Em remediação', accepted: 'Risco aceito', incident: 'Incidente aberto', dismissed: 'Descartado' };
 const STATUS_CLASS = { open: 'tag tag-accent', remediating: 'tag tag-outline', accepted: 'tag tag-neutral', incident: 'tag tag-accent', dismissed: 'tag tag-neutral' };
-const ROW_LIMIT = 500;
+const PAGE_SIZE = 50;
+const pages = {};
 const EXPIRY_WARNING_DAYS = 15;
 const MAX_SCOPE_TAGS = 8;
 const ICON = {
@@ -108,6 +109,21 @@ const emptyRow = (cols, text) => `<tr class="empty-row"><td colspan="${cols}">${
 function tableHTML(cls, columns, rows, rowAttrs, emptyText) {
   const cols = columns.filter(c => c.show !== false);
   return `<table class="table ${cls}"><thead><tr>${cols.map(c => `<th${c.right ? ' class="right"' : ''}>${c.head}</th>`).join('')}</tr></thead><tbody>${rows.map(r => `<tr${rowAttrs ? rowAttrs(r) : ''}>${cols.map(c => c.cell(r)).join('')}</tr>`).join('') || emptyRow(cols.length, emptyText)}</tbody></table>`;
+}
+// Pagination keeps long inventories at a normal page height; it resets when the filters (signature) change.
+function pageOf(key, rows, signature) {
+  const current = pages[key] || { index: 0, signature };
+  if (current.signature !== signature) current.index = 0;
+  current.signature = signature;
+  current.index = Math.min(current.index, Math.max(0, Math.ceil(rows.length / PAGE_SIZE) - 1));
+  pages[key] = current;
+  return rows.slice(current.index * PAGE_SIZE, (current.index + 1) * PAGE_SIZE);
+}
+function pagerHTML(key, total, extra = '') {
+  const index = pages[key]?.index || 0; const start = index * PAGE_SIZE; const end = Math.min(total, start + PAGE_SIZE);
+  const note = extra ? `<span class="count-text">${escapeHtml(extra)}</span>` : '';
+  if (total <= PAGE_SIZE) return `<div class="pager"><span class="count-text">${fmt(total)} registro(s)</span>${note}</div>`;
+  return `<div class="pager"><span class="count-text num">${fmt(start + 1)}–${fmt(end)} de ${fmt(total)}</span><button type="button" class="btn btn-secondary btn-sm" data-pager="${key}" data-step="-1"${index === 0 ? ' disabled' : ''}>← Anterior</button><button type="button" class="btn btn-secondary btn-sm" data-pager="${key}" data-step="1"${end >= total ? ' disabled' : ''}>Próxima →</button>${note}</div>`;
 }
 function hiddenNote(labels) { return labels.length ? `Colunas ocultas por falta de dados do provedor: ${labels.join(', ')}.` : ''; }
 function paint(root = document) {
@@ -318,7 +334,7 @@ function lifecycleTag(item) {
   return '<span class="tag tag-neutral">Ativa</span>';
 }
 function renderIdentities() {
-  const s = state.ids.summary; const rows = filteredIdentities(); const shown = rows.slice(0, ROW_LIMIT);
+  const s = state.ids.summary; const rows = filteredIdentities(); const shown = pageOf('ids', rows, `${state.ids.type}|${state.ids.provider}|${state.ids.q}`);
   setHTML('#id-kpis', [
     stat('Identidades', fmt(s.total), 'inventário normalizado'),
     stat('Humanas', fmt(s.humans), `${pct(s.humans, s.total)}% do inventário`),
@@ -327,7 +343,7 @@ function renderIdentities() {
     s.mfaKnown ? stat('Sem MFA', fmt(s.noMfa), `de ${fmt(s.mfaKnown)} humanas com MFA informado`, true) : stat('Sem MFA', '—', 'MFA não informado pelo provedor'),
     s.lastSeenKnown ? stat('Inativas > 90 dias', fmt(s.inactive90), `de ${fmt(s.lastSeenKnown)} com último login conhecido`) : stat('Inativas > 90 dias', '—', 'último login não informado'),
   ].join(''));
-  $('#id-count').textContent = `${fmt(shown.length)} de ${fmt(s.total)} exibidas${rows.length > ROW_LIMIT ? ` · refine a busca para ver as ${fmt(rows.length - ROW_LIMIT)} restantes` : ''}`;
+  $('#id-count').textContent = `${fmt(rows.length)} de ${fmt(s.total)} identidades`;
   const seen = state.ids.list.some(item => item.lastSeenAt);
   const multiProvider = new Set(state.ids.list.map(item => item.provider)).size > 1;
   const multiEnvironment = new Set(state.ids.list.map(item => item.environment)).size > 1;
@@ -341,6 +357,7 @@ function renderIdentities() {
     { head: 'Ciclo de vida', cell: item => `<td>${lifecycleTag(item)}</td>` },
     { head: 'Último login', show: seen, cell: item => `<td class="muted nowrap">${ago(item.lastSeenAt)}</td>` },
   ], shown, item => ` class="clickable${item.id === state.ids.selected ? ' selected' : ''}" data-identity="${item.id}"`, state.ids.list.length ? 'Nenhuma identidade corresponde aos filtros.' : 'Execute uma análise para preencher o inventário.'));
+  setHTML('#id-foot', pagerHTML('ids', rows.length));
 }
 async function selectIdentity(id) {
   state.ids.selected = id;
@@ -405,7 +422,7 @@ function renderAccesses() {
   let table = ''; let total = 0; let shownCount = 0; let note = '';
   if (a.view === 'grants') {
     const rows = a.grants.filter(g => providerOk(g.provider) && (!a.unused || isStale(g)) && accessMatches(`${g.identityName} ${g.identityId} ${g.resourceName} ${g.role}`));
-    total = rows.length; const shown = rows.slice(0, ROW_LIMIT); shownCount = shown.length;
+    total = rows.length; const shown = pageOf('acc', rows, `${a.view}|${a.prov}|${a.unused}|${a.q}`); shownCount = shown.length;
     const has = { granted: a.grants.some(g => g.grantedAt), used: a.grants.some(g => g.lastUsedAt), usage: a.grants.some(g => g.totalPermissions) };
     note = hiddenNote([!has.granted && 'concedido', !has.used && 'último uso', !has.usage && 'permissões usadas'].filter(Boolean));
     table = tableHTML(has.usage || has.used ? 'min-900' : 'min-720', [
@@ -420,19 +437,19 @@ function renderAccesses() {
     ], shown, g => isStale(g) ? ' class="stale"' : '', a.grants.length ? 'Nenhuma concessão corresponde aos filtros.' : 'Execute uma análise para preencher o inventário.');
   } else if (a.view === 'projects') {
     const rows = (a.projects || []).filter(p => providerOk(p.provider) && accessMatches(`${p.name} ${p.resourceId} ${p.environment}`));
-    total = rows.length; const shown = rows.slice(0, ROW_LIMIT); shownCount = shown.length;
+    total = rows.length; const shown = pageOf('acc', rows, `${a.view}|${a.prov}|${a.unused}|${a.q}`); shownCount = shown.length;
     table = `<table class="table min-820"><thead><tr><th>Projeto / recurso</th><th>Ambiente</th><th>Tipo</th><th class="right">Identidades</th><th class="right">Concessões</th><th class="right">Privilegiadas</th><th>Riscos</th><th></th></tr></thead><tbody>${shown.map(p => `<tr><td><div class="semibold break">${escapeHtml(p.name)}</div><div class="t-sub break">${escapeHtml(p.resourceId)}</div></td><td>${escapeHtml(p.provider)} · ${escapeHtml(p.environment)}</td><td>${RESOURCE_LABEL[p.type] || escapeHtml(p.type)}</td><td class="right num">${fmt(p.identityCount)}</td><td class="right num">${fmt(p.accessCount)}</td><td class="right num">${fmt(p.privilegedCount)}</td><td>${p.findingCount ? `${sevTag(p.maxSeverity || 'medium')} <span class="num">${fmt(p.findingCount)}</span>` : '<span class="muted">Nenhum</span>'}</td><td class="right"><button type="button" class="btn btn-secondary btn-sm" data-open-project="${p.credentialId}" data-resource="${escapeHtml(p.resourceId)}">Abrir</button></td></tr>`).join('') || emptyRow(8, 'Nenhum projeto com concessões.')}</tbody></table>`;
   } else if (a.view === 'roles') {
     const rows = (a.roles || []).filter(r => providerOk(r.provider) && accessMatches(`${r.role} ${r.roleLabel} ${r.environment}`));
-    total = rows.length; const shown = rows.slice(0, ROW_LIMIT); shownCount = shown.length;
+    total = rows.length; const shown = pageOf('acc', rows, `${a.view}|${a.prov}|${a.unused}|${a.q}`); shownCount = shown.length;
     table = `<table class="table min-900"><thead><tr><th>Papel</th><th>Ambiente</th><th>Capacidade efetiva</th><th class="right">Identidades</th><th class="right">Recursos</th><th class="right">Concessões</th><th class="right">Privilegiadas</th><th>Criticidade</th></tr></thead><tbody>${shown.map(r => `<tr><td><div class="semibold break">${escapeHtml(r.roleLabel)}</div><div class="t-sub mono break">${escapeHtml(r.role)}</div></td><td>${escapeHtml(r.provider)} · ${escapeHtml(r.environment)}</td><td>${escapeHtml(r.capability)}</td><td class="right num">${fmt(r.identityCount)}</td><td class="right num">${fmt(r.resourceCount)}</td><td class="right num">${fmt(r.accessCount)}</td><td class="right num">${fmt(r.privilegedCount)}</td><td>${sevTag(r.severity)}</td></tr>`).join('') || emptyRow(8, 'Nenhum papel concedido.')}</tbody></table>`;
   } else {
     const rows = (a.accounts || []).filter(r => providerOk(r.provider) && accessMatches(`${r.name} ${r.externalId} ${r.email || ''}`));
-    total = rows.length; const shown = rows.slice(0, ROW_LIMIT); shownCount = shown.length;
+    total = rows.length; const shown = pageOf('acc', rows, `${a.view}|${a.prov}|${a.unused}|${a.q}`); shownCount = shown.length;
     table = `<table class="table min-900"><thead><tr><th>Conta</th><th>Ambiente</th><th>Tipo</th><th>Estado</th><th class="right">Recursos</th><th class="right">Concessões</th><th class="right">Privilegiadas</th><th class="right">Riscos</th><th></th></tr></thead><tbody>${shown.map(r => `<tr><td><div class="semibold break">${escapeHtml(r.name)}</div><div class="t-sub break">${escapeHtml(r.externalId)}</div></td><td>${escapeHtml(r.provider)} · ${escapeHtml(r.environment)}</td><td>${TYPE_LABEL[r.type] || escapeHtml(r.type)}</td><td>${r.enabled ? 'Ativa' : 'Desabilitada'}</td><td class="right num">${fmt(r.resourceCount)}</td><td class="right num">${fmt(r.accessCount)}</td><td class="right num">${fmt(r.privilegedCount)}</td><td class="right num">${fmt(r.findingCount)}</td><td class="right"><button type="button" class="btn btn-secondary btn-sm" data-open-identity="${r.id}">Ver identidade</button></td></tr>`).join('') || emptyRow(9, 'Nenhuma conta coletada.')}</tbody></table>`;
   }
   setHTML('#acc-table', table);
-  $('#acc-foot').textContent = `${total > shownCount ? `Exibindo ${fmt(shownCount)} de ${fmt(total)}. Use a busca para refinar.` : `${fmt(total)} registro(s).`} ${note}`.trim();
+  setHTML('#acc-foot', pagerHTML('acc', total, note));
 }
 async function openProject(credentialId, resourceId) {
   const modal = $('#project-modal'); const content = $('#project-content');
@@ -472,10 +489,10 @@ function renderRisks() {
   const providers = [...new Set(state.credentials.map(c => c.provider))].join(', ') || 'nenhum provedor';
   setHTML('#risk-rule', `<div class="rule-info-main"><div class="card-title">${rule ? escapeHtml(rule.name) : 'Todas as regras'}</div><div>${rule ? escapeHtml(rule.description) : `Visão consolidada dos ${fmt(open.length)} riscos ativos em ${escapeHtml(providers)}, ordenados por severidade.`}</div></div><div class="rule-info-crit"><span class="overline">Critério</span><b>${rule ? escapeHtml(rule.criterion) : 'Severidade × exposição × privilégio'}</b>${rule ? `<span class="muted-sm">${escapeHtml(rule.framework)} · ${escapeHtml(rule.control)}</span>` : ''}</div>`);
   const rows = r.findings.filter(f => (r.rule === 'all' || f.rule === r.rule) && (!r.severity || f.severity === r.severity));
-  const shown = rows.slice(0, ROW_LIMIT); const readonly = isReadonly();
+  const shown = pageOf('risk', rows, `${r.rule}|${r.severity}`); const readonly = isReadonly();
   setHTML('#risk-rows', shown.map(f => `<tr class="${['accepted', 'dismissed'].includes(f.status) ? 'faded' : ''}"><td>${sevTag(f.severity)}</td><td><div class="semibold break" title="${escapeHtml(`${f.why} Recomendação: ${f.recommendation}`)}">${escapeHtml(f.title)}</div><div class="t-sub break">F-${f.id} · ${escapeHtml(f.description)}</div></td><td class="break">${escapeHtml(f.identityName || '—')}</td><td>${escapeHtml(f.provider)} · ${escapeHtml(f.resourceName || f.environment)}</td><td>${escapeHtml(f.ruleName)}</td><td class="muted nowrap">${formatDate(f.firstSeen)}</td><td><span class="${STATUS_CLASS[f.status] || 'tag tag-neutral'}">${STATUS_LABEL[f.status] || escapeHtml(f.status)}</span></td><td><div class="row-actions">${readonly ? '' : f.status === 'open' ? `<button type="button" class="btn btn-primary btn-sm" data-finding-action="remediating" data-id="${f.id}">Remediar</button><button type="button" class="btn btn-secondary btn-sm" data-finding-action="accepted" data-id="${f.id}">Aceitar</button>` : `<button type="button" class="btn btn-ghost btn-sm" data-finding-action="open" data-id="${f.id}">Reabrir</button>`}</div></td></tr>`).join('') || emptyRow(8, r.findings.length ? 'Nenhum achado para este filtro.' : 'Nenhum risco identificado. Execute uma análise para avaliar as regras.'));
   const handled = r.findings.filter(f => f.status !== 'open').length;
-  $('#risk-foot').textContent = `Exibindo ${fmt(shown.length)} de ${fmt(rows.length)} achado(s)${handled ? ` · ${fmt(handled)} em tratamento ou aceito(s)` : ''}.`;
+  setHTML('#risk-foot', pagerHTML('risk', rows.length, handled ? `${fmt(handled)} em tratamento ou aceito(s)` : ''));
   const latest = []; const seen = new Set();
   for (const item of r.ai.filter(a => a.scopeType === 'platform')) { if (!seen.has(item.credentialId)) { seen.add(item.credentialId); latest.push(item); } }
   setHTML('#risk-ai', latest.length ? `<div class="cell-head"><div><div class="card-kicker">Análise local · Qwen</div><div class="card-title">Leitura dos achados por ambiente</div></div></div>${latest.slice(0, 3).map(a => { const env = state.credentials.find(c => c.id === a.credentialId); return `<div class="ai-box"><div class="cell-head"><span class="semibold">${escapeHtml(a.summary)}</span><span class="muted-sm">${escapeHtml(env?.name || 'Ambiente')} · ${escapeHtml(a.engine)} · ${formatDate(a.createdAt)}</span></div><dl class="ai-grid"><dt>Prioridade</dt><dd>${sevTag(a.priority)}</dd><dt>Por quê</dt><dd>${escapeHtml(a.why)}</dd><dt>Recomendação</dt><dd>${escapeHtml(a.recommendation)}</dd><dt>Tratativa</dt><dd>${escapeHtml(a.treatment)}</dd></dl></div>`; }).join('')}` : '');
@@ -507,7 +524,7 @@ function renderPrivileged() {
   ].join(''));
   const maxRole = Math.max(1, ...s.roles.map(r => r.count));
   setHTML('#priv-roles', `<div><div class="card-kicker">Papéis</div><div class="card-title">Papéis de alto impacto</div></div>${s.roles.map(r => `<div class="role-row"><span><span class="mono semibold">${escapeHtml(r.role)}</span> <span class="muted">· ${escapeHtml(r.provider)}</span></span><span>${fmt(r.count)}</span>${bar(r.count / maxRole * 100, '', 'bar-4 full')}</div>`).join('') || '<div class="empty">Nenhum papel privilegiado coletado.</div>'}<div class="stack-10 divider-top"><div class="card-title">Modelo de acesso</div><div class="split-bar">${s.grants ? `<span class="accent" data-w="${pct(s.standing, s.grants)}%"></span><span class="gray" data-w="${100 - pct(s.standing, s.grants)}%"></span>` : '<span class="gray" data-w="100%"></span>'}</div><div class="split-legend"><span><b>${fmt(s.standing)}</b> permanentes</span><span><b>${fmt(s.jit)}</b> JIT solicitado</span></div></div>`);
-  const rows = p.rows.filter(row => !p.standing || row.model === 'Permanente'); const shown = rows.slice(0, ROW_LIMIT); const readonly = isReadonly();
+  const rows = p.rows.filter(row => !p.standing || row.model === 'Permanente'); const shown = pageOf('priv', rows, String(p.standing)); const readonly = isReadonly();
   const hasMfa = p.rows.some(row => row.mfaEnabled !== null); const hasUse = p.rows.some(row => row.lastUsedAt);
   setHTML('#priv-table', tableHTML('', [
     { head: 'Identidade', cell: row => `<td class="semibold break">${escapeHtml(row.identityName)}<div class="t-sub">${TYPE_LABEL[row.identityType] || escapeHtml(row.identityType || '—')}</div></td>` },
@@ -519,7 +536,7 @@ function renderPrivileged() {
     { head: 'Risco', right: true, cell: row => `<td class="right strong num" title="Base pela criticidade do papel, +10 sem MFA, +5 sem uso">${row.riskScore}</td>` },
     { head: '', cell: row => `<td class="right"><div class="row-actions vertical">${!readonly && row.model === 'Permanente' ? `<button type="button" class="btn btn-secondary btn-sm" data-jit="${row.id}">Converter para JIT</button>` : ''}<button type="button" class="btn btn-ghost btn-sm" data-dossier="${row.id}">Ver contexto</button></div></td>` },
   ], shown, null, p.rows.length ? 'Nenhuma conta com acesso permanente.' : 'Nenhum acesso privilegiado coletado.'));
-  $('#priv-foot').textContent = `${rows.length > shown.length ? `Exibindo ${fmt(shown.length)} de ${fmt(rows.length)} concessões privilegiadas.` : ''} ${hiddenNote([!hasMfa && 'MFA', !hasUse && 'último uso'].filter(Boolean))}`.trim();
+  setHTML('#priv-foot', pagerHTML('priv', rows.length, hiddenNote([!hasMfa && 'MFA', !hasUse && 'último uso'].filter(Boolean))));
 }
 async function openDossier(id) {
   const modal = $('#dossier-modal'); const content = $('#dossier-content');
@@ -721,10 +738,11 @@ function filteredAudit() {
     && (!query || `${e.actor} ${e.action} ${e.target} ${e.title} ${e.text}`.toLowerCase().includes(query)));
 }
 function renderAudit() {
-  const a = state.audit; const rows = filteredAudit(); const shown = rows.slice(0, ROW_LIMIT);
+  const a = state.audit; const rows = filteredAudit(); const shown = pageOf('audit', rows, `${a.source}|${a.result}|${a.q}`);
   setHTML('#audit-sources', a.data.sources.map(s => `<button type="button" class="stat clickable${a.source === s.name ? ' active' : ''}" data-audit-source="${escapeHtml(s.name)}"><span class="stat-label">${escapeHtml(s.name)}</span><span class="stat-value">${fmt(s.count)}</span><span class="stat-sub">${s.collected ? 'eventos em 24 h' : 'não coletado pelos conectores'}</span></button>`).join(''));
   $('#audit-count').textContent = `${fmt(rows.length)} eventos${a.source ? ` · ${a.source}` : ''}`;
   setHTML('#audit-rows', shown.map(e => `<tr class="clickable${e.key === a.selected ? ' selected' : ''}" data-audit-key="${escapeHtml(e.key)}"><td class="num nowrap">${formatDate(e.createdAt)}</td><td class="semibold break">${escapeHtml(e.actor)}</td><td class="mono break">${escapeHtml(e.action)}</td><td class="break">${escapeHtml(e.target)}</td><td>${escapeHtml(e.source)}</td><td><span class="tag ${e.result === 'Sucesso' ? 'tag-neutral' : 'tag-accent'}">${escapeHtml(e.result)}</span></td></tr>`).join('') || emptyRow(6, 'Nenhum evento para este filtro.'));
+  setHTML('#audit-foot', pagerHTML('audit', rows.length));
   const selected = (a.data?.events || []).find(e => e.key === a.selected);
   const aside = $('#audit-aside'); aside.hidden = !selected;
   if (selected) {
@@ -823,8 +841,15 @@ async function saveSettings() {
 
 /* ══ events ══════════════════════════════════════════════════════════ */
 function applyRoleVisibility() { document.body.classList.toggle('readonly', isReadonly()); }
+const PAGERS = { ids: () => renderIdentities(), acc: () => renderAccesses(), risk: () => renderRisks(), priv: () => renderPrivileged(), audit: () => renderAudit() };
 document.addEventListener('click', event => {
   const target = event.target;
+  const pager = target.closest('[data-pager]');
+  if (pager) {
+    const key = pager.dataset.pager; pages[key].index += Number(pager.dataset.step); PAGERS[key]();
+    const table = pager.closest('.cell, section')?.querySelector('.table'); if (table && table.getBoundingClientRect().top < 0) table.scrollIntoView({ block: 'start' });
+    return;
+  }
   const closer = target.closest('[data-close]'); if (closer) { closer.closest('dialog')?.close(); return; }
   const nav = target.closest('[data-nav]'); if (nav) { navigate(nav.dataset.nav); return; }
   const review = target.closest('[data-new-review]'); if (review) { openNewReview(review.dataset.newReview, review.dataset.identityId ? { id: review.dataset.identityId, name: review.dataset.identityName } : null); return; }

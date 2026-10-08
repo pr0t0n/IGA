@@ -253,6 +253,8 @@ dialog.dialog::backdrop { background: color-mix(in srgb, var(--color-neutral-900
 .filters .input.w180 { width: 180px; } .filters .input.w240 { width: 240px; }
 .count-text { font-size: 13px; color: var(--color-neutral-700); }
 .foot-text { font-size: 13px; color: var(--color-neutral-700); padding-top: 12px; }
+.pager { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.pager .count-text:first-child { margin-right: 4px; }
 
 /* ── Dashboard ────────────────────────────────────────────────────────── */
 .score-row { display: flex; align-items: flex-end; gap: 16px; flex-wrap: wrap; }
