@@ -412,6 +412,7 @@ function renderAccesses() {
   ].join(''));
   const providerOk = provider => a.prov === 'all' || provider === a.prov;
   let table = ''; let total = 0; let shownCount = 0; let note = '';
+  const multiEnv = new Set(a.grants.map(g => g.credentialId)).size > 1;
   if (a.view === 'grants') {
     const rows = a.grants.filter(g => providerOk(g.provider) && (!a.unused || isStale(g)) && accessMatches(`${g.identityName} ${g.identityId} ${g.resourceName} ${g.role}`));
     total = rows.length; const shown = pageOf('acc', rows, `${a.view}|${a.prov}|${a.unused}|${a.q}`); shownCount = shown.length;
@@ -419,7 +420,7 @@ function renderAccesses() {
     note = hiddenNote([!has.granted && 'concedido', !has.used && 'último uso', !has.usage && 'permissões usadas'].filter(Boolean));
     table = tableHTML(has.usage || has.used ? 'min-900' : 'min-720', [
       { head: 'Identidade', cell: g => `<td><div class="semibold break">${escapeHtml(g.identityName)}</div><div class="t-sub">${TYPE_LABEL[g.identityType] || escapeHtml(g.identityType || 'Identidade')}</div></td>` },
-      { head: 'Recurso', cell: g => `<td><div class="break">${escapeHtml(g.resourceName)}</div><div class="t-sub">${escapeHtml(g.provider)} · ${escapeHtml(g.environment)}</div></td>` },
+      { head: 'Recurso', cell: g => `<td><div class="break">${escapeHtml(g.resourceName)}</div><div class="t-sub">${escapeHtml(g.provider)}${multiEnv ? ` · ${escapeHtml(g.environment)}` : ''}</div></td>` },
       { head: 'Papel / permissão', cell: g => `<td class="mono break">${escapeHtml(g.role)}</td>` },
       { head: 'Origem', cell: g => `<td>${escapeHtml(g.origin)}</td>` },
       { head: 'Nível', cell: g => `<td>${g.privileged ? '<span class="tag tag-accent">Privilegiado</span>' : '<span class="tag tag-neutral">Padrão</span>'}${g.wildcard ? ' <span class="tag tag-outline" title="Permissão irrestrita">*</span>' : ''}</td>` },
@@ -430,15 +431,15 @@ function renderAccesses() {
   } else if (a.view === 'projects') {
     const rows = (a.projects || []).filter(p => providerOk(p.provider) && accessMatches(`${p.name} ${p.resourceId} ${p.environment}`));
     total = rows.length; const shown = pageOf('acc', rows, `${a.view}|${a.prov}|${a.unused}|${a.q}`); shownCount = shown.length;
-    table = `<table class="table min-820"><thead><tr><th>Projeto / recurso</th><th>Ambiente</th><th>Tipo</th><th class="right">Identidades</th><th class="right">Concessões</th><th class="right">Privilegiadas</th><th>Riscos</th><th></th></tr></thead><tbody>${shown.map(p => `<tr><td><div class="semibold break">${escapeHtml(p.name)}</div><div class="t-sub break">${escapeHtml(p.resourceId)}</div></td><td>${escapeHtml(p.provider)} · ${escapeHtml(p.environment)}</td><td>${RESOURCE_LABEL[p.type] || escapeHtml(p.type)}</td><td class="right num">${fmt(p.identityCount)}</td><td class="right num">${fmt(p.accessCount)}</td><td class="right num">${fmt(p.privilegedCount)}</td><td>${p.findingCount ? `${sevTag(p.maxSeverity || 'medium')} <span class="num">${fmt(p.findingCount)}</span>` : '<span class="muted">Nenhum</span>'}</td><td class="right"><button type="button" class="btn btn-secondary btn-sm" data-open-project="${p.credentialId}" data-resource="${escapeHtml(p.resourceId)}">Abrir</button></td></tr>`).join('') || emptyRow(8, 'Nenhum projeto com concessões.')}</tbody></table>`;
+    table = `<table class="table min-820"><thead><tr><th>Projeto / recurso</th>${multiEnv ? '<th>Ambiente</th>' : ''}<th>Tipo</th><th class="right">Identidades</th><th class="right">Concessões</th><th class="right">Privilegiadas</th><th>Riscos</th><th></th></tr></thead><tbody>${shown.map(p => `<tr><td><div class="semibold break">${escapeHtml(p.name)}</div><div class="t-sub break">${escapeHtml(p.resourceId)}</div></td>${multiEnv ? `<td>${escapeHtml(p.provider)} · ${escapeHtml(p.environment)}</td>` : ''}<td>${RESOURCE_LABEL[p.type] || escapeHtml(p.type)}</td><td class="right num">${fmt(p.identityCount)}</td><td class="right num">${fmt(p.accessCount)}</td><td class="right num">${fmt(p.privilegedCount)}</td><td>${p.findingCount ? `${sevTag(p.maxSeverity || 'medium')} <span class="num">${fmt(p.findingCount)}</span>` : '<span class="muted">Nenhum</span>'}</td><td class="right"><button type="button" class="btn btn-secondary btn-sm" data-open-project="${p.credentialId}" data-resource="${escapeHtml(p.resourceId)}">Abrir</button></td></tr>`).join('') || emptyRow(multiEnv ? 8 : 7, 'Nenhum projeto com concessões.')}</tbody></table>`;
   } else if (a.view === 'roles') {
     const rows = (a.roles || []).filter(r => providerOk(r.provider) && accessMatches(`${r.role} ${r.roleLabel} ${r.environment}`));
     total = rows.length; const shown = pageOf('acc', rows, `${a.view}|${a.prov}|${a.unused}|${a.q}`); shownCount = shown.length;
-    table = `<table class="table min-900"><thead><tr><th>Papel</th><th>Ambiente</th><th>Capacidade efetiva</th><th class="right">Identidades</th><th class="right">Recursos</th><th class="right">Concessões</th><th class="right">Privilegiadas</th><th>Criticidade</th></tr></thead><tbody>${shown.map(r => `<tr><td><div class="semibold break">${escapeHtml(r.roleLabel)}</div><div class="t-sub mono break">${escapeHtml(r.role)}</div></td><td>${escapeHtml(r.provider)} · ${escapeHtml(r.environment)}</td><td>${escapeHtml(r.capability)}</td><td class="right num">${fmt(r.identityCount)}</td><td class="right num">${fmt(r.resourceCount)}</td><td class="right num">${fmt(r.accessCount)}</td><td class="right num">${fmt(r.privilegedCount)}</td><td>${sevTag(r.severity)}</td></tr>`).join('') || emptyRow(8, 'Nenhum papel concedido.')}</tbody></table>`;
+    table = `<table class="table min-900"><thead><tr><th>Papel</th>${multiEnv ? '<th>Ambiente</th>' : ''}<th>Capacidade efetiva</th><th class="right">Identidades</th><th class="right">Recursos</th><th class="right">Concessões</th><th class="right">Privilegiadas</th><th>Criticidade</th></tr></thead><tbody>${shown.map(r => `<tr><td><div class="semibold break">${escapeHtml(r.roleLabel)}</div>${r.roleLabel !== r.role ? `<div class="t-sub mono break">${escapeHtml(r.role)}</div>` : ''}</td>${multiEnv ? `<td>${escapeHtml(r.provider)} · ${escapeHtml(r.environment)}</td>` : ''}<td>${escapeHtml(r.capability)}</td><td class="right num">${fmt(r.identityCount)}</td><td class="right num">${fmt(r.resourceCount)}</td><td class="right num">${fmt(r.accessCount)}</td><td class="right num">${fmt(r.privilegedCount)}</td><td>${sevTag(r.severity)}</td></tr>`).join('') || emptyRow(multiEnv ? 8 : 7, 'Nenhum papel concedido.')}</tbody></table>`;
   } else {
     const rows = (a.accounts || []).filter(r => providerOk(r.provider) && accessMatches(`${r.name} ${r.externalId} ${r.email || ''}`));
     total = rows.length; const shown = pageOf('acc', rows, `${a.view}|${a.prov}|${a.unused}|${a.q}`); shownCount = shown.length;
-    table = `<table class="table min-900"><thead><tr><th>Conta</th><th>Ambiente</th><th>Tipo</th><th>Estado</th><th class="right">Recursos</th><th class="right">Concessões</th><th class="right">Privilegiadas</th><th class="right">Riscos</th><th></th></tr></thead><tbody>${shown.map(r => `<tr><td><div class="semibold break">${escapeHtml(r.name)}</div><div class="t-sub break">${escapeHtml(r.externalId)}</div></td><td>${escapeHtml(r.provider)} · ${escapeHtml(r.environment)}</td><td>${TYPE_LABEL[r.type] || escapeHtml(r.type)}</td><td>${r.enabled ? 'Ativa' : 'Desabilitada'}</td><td class="right num">${fmt(r.resourceCount)}</td><td class="right num">${fmt(r.accessCount)}</td><td class="right num">${fmt(r.privilegedCount)}</td><td class="right num">${fmt(r.findingCount)}</td><td class="right"><button type="button" class="btn btn-secondary btn-sm" data-open-identity="${r.id}">Ver identidade</button></td></tr>`).join('') || emptyRow(9, 'Nenhuma conta coletada.')}</tbody></table>`;
+    table = `<table class="table min-900"><thead><tr><th>Conta</th>${multiEnv ? '<th>Ambiente</th>' : ''}<th>Tipo</th><th>Estado</th><th class="right">Recursos</th><th class="right">Concessões</th><th class="right">Privilegiadas</th><th class="right">Riscos</th><th></th></tr></thead><tbody>${shown.map(r => `<tr><td><div class="semibold break">${escapeHtml(r.name)}</div><div class="t-sub break">${escapeHtml(r.externalId)}</div></td>${multiEnv ? `<td>${escapeHtml(r.provider)} · ${escapeHtml(r.environment)}</td>` : ''}<td>${TYPE_LABEL[r.type] || escapeHtml(r.type)}</td><td>${r.enabled ? 'Ativa' : 'Desabilitada'}</td><td class="right num">${fmt(r.resourceCount)}</td><td class="right num">${fmt(r.accessCount)}</td><td class="right num">${fmt(r.privilegedCount)}</td><td class="right num">${fmt(r.findingCount)}</td><td class="right"><button type="button" class="btn btn-secondary btn-sm" data-open-identity="${r.id}">Ver identidade</button></td></tr>`).join('') || emptyRow(multiEnv ? 9 : 8, 'Nenhuma conta coletada.')}</tbody></table>`;
   }
   setHTML('#acc-table', table);
   setHTML('#acc-foot', pagerHTML('acc', total, note));
@@ -1018,8 +1019,21 @@ async function initializePlatform() {
   await Promise.all([loadCredentialRequirements(), loadCredentials(), loadStatus(), loadSettings()]);
   navigate(canSee(state.page) ? state.page : 'dashboard');
 }
+// A tab left open keeps running the old bundle; compare the deployed bundle's ETag and reload when it changes.
+let deployedVersion = null;
+async function checkForUpdate() {
+  try {
+    const responses = await Promise.all(['./', 'app.js', 'modernist.css'].map(file => fetch(`${file}?probe=${Date.now()}`, { method: 'HEAD', cache: 'no-store' })));
+    const version = responses.map(response => response.headers.get('ETag') || response.headers.get('Last-Modified') || '').join('|');
+    if (!version.replaceAll('|', '')) return;
+    if (deployedVersion && version !== deployedVersion && !$$('dialog[open]').length) { toast('Nova versão publicada. Atualizando…'); setTimeout(() => location.reload(), 800); return; }
+    deployedVersion = version;
+  } catch { /* offline: try again later */ }
+}
+setInterval(checkForUpdate, 30000);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') checkForUpdate(); });
 async function bootstrap() {
-  paint();
+  paint(); checkForUpdate();
   if (!state.token) { showLogin(); return; }
   try { state.user = await api('/auth/me'); applyUser(); await initializePlatform(); } catch { showLogin(); }
 }
