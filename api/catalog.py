@@ -15,6 +15,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "schedule": "manual",
     "notifications": {"critical": True, "ueba": True, "credential": True, "weekly": False},
     "webhook": "",
+    "corporateDomains": [],
 }
 RULE_PARAMETERS = [
     ("creep_days", "Access Creep", "Tempo em movimentação (mover) até acusar acúmulo", "dias", 1, 365),
@@ -48,13 +49,16 @@ RULE_DETAILS = {
                       "Principal allUsers ou allAuthenticatedUsers em política IAM"),
     "SERVICE_ACCOUNT_ADMIN": ("Identidades não humanas com funções administrativas amplas.",
                               "Conta de serviço com owner, editor ou administração de IAM"),
+    "IMPERSONATION_PATH": ("Identidades que chegam a privilégios administrativos indiretamente, personificando uma conta de serviço "
+                           "(emissão de tokens, actAs, workload identity ou trust policy).",
+                           "Cadeia de personificação até uma conta com papel privilegiado que a identidade não tem diretamente"),
 }
 
 # Rows of the "Risco por módulo × provedor" heatmap: open findings of these rules (None = all rules).
 MODULES = [
     ("Identity Inventory", {"ORPHAN_ACCOUNT", "JML"}),
     ("Access Inventory", {"PERMISSION_USAGE", "ACCESS_CREEP"}),
-    ("Access Intelligence", {"TOXIC_COMBINATION", "PUBLIC_ACCESS"}),
+    ("Access Intelligence", {"TOXIC_COMBINATION", "PUBLIC_ACCESS", "IMPERSONATION_PATH"}),
     ("Access Risk", None),
     ("Privileged Access", {"SERVICE_ACCOUNT_ADMIN"}),
     ("UEBA", {"UEBA_ANOMALY"}),
@@ -90,6 +94,7 @@ FRAMEWORKS = {
         ("1.5 (GCP)", "Service accounts sem privilégios de administrador", "Privileged Access", "rule", "SERVICE_ACCOUNT_ADMIN"),
         ("1.1 (GCP)", "Recursos sem acesso público em políticas IAM", "Access Intelligence", "rule", "PUBLIC_ACCESS"),
         ("1.16", "Contas sem responsável removidas", "Orphan Account", "rule", "ORPHAN_ACCOUNT"),
+        ("1.6 (GCP)", "Usuários sem papéis de personificação de contas de serviço", "Caminhos de acesso", "rule", "IMPERSONATION_PATH"),
     ]),
 }
 
@@ -116,6 +121,7 @@ def merged_settings(stored: dict[str, Any] | None) -> dict[str, Any]:
         "schedule": stored.get("schedule") if stored.get("schedule") in SCHEDULES else DEFAULT_SETTINGS["schedule"],
         "notifications": {**DEFAULT_SETTINGS["notifications"], **(stored.get("notifications") or {})},
         "webhook": stored.get("webhook") or "",
+        "corporateDomains": [str(item) for item in stored.get("corporateDomains") or []][:20],
     }
 
 

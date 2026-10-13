@@ -22,6 +22,8 @@ from pydantic import BaseModel, Field, field_validator
 from catalog import (DEFAULT_SETTINGS, FRAMEWORKS, MODULES, RULE_DETAILS, RULE_PARAMETERS, SCHEDULES, SEVERITY_ORDER,
                      classify_event, explain_anomaly, framework_report, humanize_method, identity_risk, merged_settings,
                      risk_level, risk_score)
+from governance import (ACTION_LABEL, AccessGraph, ai_kind, build_recommendations, corporate_domains, days_ago,
+                        impersonation_edges, is_external, is_google_managed, member_name, nhi_flags, owner_of)
 from connectors import REQUIREMENTS, USAGE_HINT, ConnectorError, aws_expiry, describe_credential, discover, normalize_credential, probe, scope_entry
 
 DB_PATH = os.getenv("DATABASE_PATH", "/data/iga.db")
@@ -48,6 +50,10 @@ RULE_CATALOG = {
     "AUTHENTICATION_POSTURE": {"name": "Postura de autenticação", "framework": "CIS Foundations", "control": "MFA", "providers": {"AWS"}},
     "ACCESS_REVIEW": {"name": "Access Review", "framework": "NIST AC-2 / ISO 27001", "control": "Recertificação", "providers": set()},
     "UEBA_ANOMALY": {"name": "Anomalia UEBA", "framework": "MITRE ATT&CK", "control": "Telemetria comportamental", "providers": set()},
+    "IMPERSONATION_PATH": {"name": "Escalada por personificação", "framework": "CIS GCP 1.6 / MITRE T1078", "control": "Caminhos de acesso indiretos", "providers": {"GCP", "AWS"},
+                           "why": "A identidade não tem o privilégio diretamente, mas pode personificar uma conta de serviço que tem.",
+                           "recommendation": "Remover o papel de personificação (Token Creator, Service Account User, trust policy) ou reduzir o privilégio da conta de serviço.",
+                           "treatment": "Confirmar a necessidade da personificação, restringir ao menor escopo e registrar o responsável pela conta de serviço."},
 }
 
 DEFAULT_RULE_GUIDANCE = {"why": "A evidência coletada viola a regra de governança configurada.", "recommendation": "Aplicar menor privilégio e validar o acesso com o responsável.", "treatment": "Revisar, aprovar ou remover o acesso e registrar a justificativa na trilha de auditoria."}
@@ -128,6 +134,12 @@ class SettingsInput(BaseModel):
     schedule: Literal["manual", "daily", "6h", "hourly"]
     notifications: dict[str, bool]
     webhook: str = Field(default="", max_length=500)
+    corporateDomains: list[str] = Field(default_factory=list, max_length=20)
+
+
+class RecommendationUpdate(BaseModel):
+    status: Literal["open", "dismissed"]
+    justification: str | None = Field(default=None, min_length=3, max_length=500)
 
 
 class InviteInput(BaseModel):
@@ -416,6 +428,56 @@ def init_db() -> None:
             requested_by TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS service_accounts (
+            id {serial},
+            credential_id INTEGER NOT NULL REFERENCES credentials(id) ON DELETE CASCADE,
+            external_id TEXT NOT NULL,
+            email TEXT NOT NULL,
+            project_id TEXT,
+            display_name TEXT,
+            description TEXT,
+            disabled INTEGER NOT NULL DEFAULT 0,
+            keys_json TEXT NOT NULL DEFAULT '[]',
+            created_by TEXT,
+            created_at TEXT,
+            owner_hint TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_service_accounts_credential ON service_accounts(credential_id);
+        CREATE TABLE IF NOT EXISTS impersonation_edges (
+            id {serial},
+            credential_id INTEGER NOT NULL REFERENCES credentials(id) ON DELETE CASCADE,
+            source TEXT NOT NULL,
+            target TEXT NOT NULL,
+            role TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            resource_id TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_impersonation_credential ON impersonation_edges(credential_id);
+        CREATE TABLE IF NOT EXISTS recommendations (
+            id {serial},
+            credential_id INTEGER NOT NULL REFERENCES credentials(id) ON DELETE CASCADE,
+            rec_key TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            identity_external_id TEXT NOT NULL,
+            identity_name TEXT NOT NULL,
+            identity_type TEXT,
+            resource_id TEXT NOT NULL,
+            resource_name TEXT NOT NULL,
+            granted_role TEXT NOT NULL,
+            action TEXT NOT NULL,
+            suggested_json TEXT NOT NULL DEFAULT '[]',
+            reason TEXT NOT NULL,
+            source TEXT NOT NULL,
+            privileged INTEGER NOT NULL DEFAULT 0,
+            severity TEXT NOT NULL,
+            command TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            status_note TEXT,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            resolved_at TEXT,
+            UNIQUE(credential_id, rec_key)
+        );
         CREATE TABLE IF NOT EXISTS platform_settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
@@ -431,7 +493,7 @@ def init_db() -> None:
         ensure_columns(connection, "platform_users", {"last_login_at": "TEXT"})
         ensure_columns(connection, "findings", {"updated_at": "TEXT", "evidence_json": "TEXT"})
         ensure_columns(connection, "access_grants", {"used_permissions": "INTEGER", "total_permissions": "INTEGER"})
-        ensure_columns(connection, "scans", {"usage_status": "TEXT"})
+        ensure_columns(connection, "scans", {"usage_status": "TEXT", "usage_detail": "TEXT"})
         if connection.postgres:
             connection.execute("ALTER TABLE platform_users DROP CONSTRAINT IF EXISTS platform_users_role_check")
             connection.execute("ALTER TABLE platform_users ADD CONSTRAINT platform_users_role_check "
@@ -627,7 +689,7 @@ def decrypt_credential(row: Any) -> dict[str, Any]:
 def latest_collection(connection: DatabaseConnection, credential_id: int | None = None) -> dict[int, Any]:
     clause, params = (" AND credential_id=?", (credential_id,)) if credential_id is not None else ("", ())
     rows = connection.execute(
-        f"""SELECT credential_id,usage_status,telemetry_status FROM scans WHERE id IN (
+        f"""SELECT credential_id,usage_status,usage_detail,telemetry_status FROM scans WHERE id IN (
             SELECT MAX(id) FROM scans WHERE status='completed'{clause} GROUP BY credential_id)""", params).fetchall()
     return {row["credential_id"]: row for row in rows}
 
@@ -637,7 +699,8 @@ def collection_view(provider: str, scan: Any | None) -> dict[str, Any]:
     if scan is None:
         return {"usageStatus": None, "telemetryStatus": None, "collectionHint": ""}
     usage = scan["usage_status"] or "not_collected"
-    hint = "" if usage == "collected" else USAGE_HINT.get(provider, "")
+    detail = scan["usage_detail"] if "usage_detail" in scan.keys() else None
+    hint = "" if usage == "collected" else (f"O provedor informou: {detail}." if detail else USAGE_HINT.get(provider, ""))
     return {"usageStatus": usage, "telemetryStatus": scan["telemetry_status"], "collectionHint": hint}
 
 
@@ -995,6 +1058,8 @@ def update_credential(credential_id: int, payload: CredentialUpdate, request: Re
         connection.execute("DELETE FROM identities WHERE credential_id=?", (credential_id,))
         connection.execute("DELETE FROM access_grants WHERE credential_id=?", (credential_id,))
         connection.execute("DELETE FROM cloud_resources WHERE credential_id=?", (credential_id,))
+        for table in ("service_accounts", "impersonation_edges", "recommendations", "telemetry_events"):
+            connection.execute(f"DELETE FROM {table} WHERE credential_id=?", (credential_id,))
         connection.execute(
             """UPDATE credentials SET name=?,provider=?,encrypted_payload=?,scope=?,status=?,auth_kind=?,principal=?,
                scopes_json=?,last_error=NULL,expires_at=?,last_synced_at=NULL,updated_at=? WHERE id=?""",
@@ -1137,6 +1202,70 @@ def dashboard(credential_id: int | None = None) -> dict[str, Any]:
     }
 
 
+IMPERSONATION_VERBS = {"roles/iam.serviceAccountTokenCreator": "emitir tokens como", "roles/iam.serviceAccountUser": "agir como",
+                       "roles/iam.workloadIdentityUser": "usar a identidade de workload de", "roles/iam.serviceAccountOpenIdTokenCreator": "emitir tokens OpenID como",
+                       "roles/owner": "administrar", "roles/editor": "agir como", "roles/iam.serviceAccountAdmin": "administrar", "sts:AssumeRole": "assumir a role"}
+
+
+def impersonation_findings(identities: list[dict[str, Any]], accesses: list[dict[str, Any]], edges: list[dict[str, Any]],
+                           settings: dict[str, Any], limit: int = 500) -> list[dict[str, Any]]:
+    """One finding per identity × privileged account it can reach through impersonation."""
+    by_id = {str(item["id"]): item for item in identities}
+    domains = corporate_domains(identities, settings.get("corporateDomains", []))
+    paths = AccessGraph(accesses, edges).escalation_paths(by_id, domains, limit=20000)
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    for path in paths:
+        final = path["chain"][-1]["target"]
+        group = grouped.setdefault((path["source"], final), {"path": path, "grants": []})
+        group["grants"].append(f"{path['role']} em {path['resourceName']}")
+        if path["severity"] == "critical":
+            group["path"] = path
+    results = []
+    for (source, final), group in list(grouped.items())[:limit]:
+        path = group["path"]
+        steps = "; ".join(f"pode {IMPERSONATION_VERBS.get(step['role'], 'personificar')} {member_name(step['target'])} ({step['role']}"
+                          + (" no projeto" if step["scope"] == "project" else "") + ")" for step in path["chain"])
+        grants = sorted(set(group["grants"]))
+        description = (f"{member_name(source)} {steps}. Por essa cadeia, obtém {', '.join(grants[:3])}"
+                       + (f" e mais {len(grants) - 3}" if len(grants) > 3 else "") + ", que não possui diretamente."
+                       + (" A origem é externa à organização." if path["external"] else ""))
+        results.append(finding("IMPERSONATION_PATH", path["severity"], f"Escalada por personificação de {member_name(final)}",
+                               description, source, path["resourceId"],
+                               {"target": final, "chain": path["chain"], "grants": len(grants), "external": path["external"]}))
+    return results
+
+
+def store_recommendations(connection: DatabaseConnection, credential_id: int, recommendations: list[dict[str, Any]],
+                          accesses: list[dict[str, Any]]) -> None:
+    """Upsert this scan's recommendations; ones that disappeared become 'resolved' when the grant is gone (implemented)."""
+    now = utc_now()
+    existing = {row["rec_key"]: row for row in connection.execute("SELECT * FROM recommendations WHERE credential_id=?", (credential_id,)).fetchall()}
+    seen = set()
+    for rec in recommendations:
+        seen.add(rec["key"])
+        values = (rec["provider"], rec["identityId"], rec["identityName"], rec["identityType"], rec["resourceId"], rec["resourceName"],
+                  rec["role"], rec["action"], json.dumps(rec["suggestedRoles"]), rec["reason"], rec["source"], int(rec["privileged"]),
+                  rec["severity"], rec["command"])
+        previous = existing.get(rec["key"])
+        if previous:
+            status = previous["status"] if previous["status"] == "dismissed" else "open"
+            connection.execute(
+                """UPDATE recommendations SET provider=?,identity_external_id=?,identity_name=?,identity_type=?,resource_id=?,resource_name=?,
+                   granted_role=?,action=?,suggested_json=?,reason=?,source=?,privileged=?,severity=?,command=?,status=?,last_seen_at=?,
+                   resolved_at=NULL WHERE id=?""", (*values, status, now, previous["id"]))
+        else:
+            connection.execute(
+                """INSERT INTO recommendations(provider,identity_external_id,identity_name,identity_type,resource_id,resource_name,granted_role,
+                   action,suggested_json,reason,source,privileged,severity,command,credential_id,rec_key,status,first_seen_at,last_seen_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (*values, credential_id, rec["key"], "open", now, now))
+    grants = {(str(g["identityId"]), str(g["resourceId"]), str(g["role"])) for g in accesses}
+    for key, previous in existing.items():
+        if key not in seen and previous["status"] == "open":
+            implemented = (previous["identity_external_id"], previous["resource_id"], previous["granted_role"]) not in grants
+            connection.execute("UPDATE recommendations SET status=?,resolved_at=? WHERE id=?",
+                               ("resolved" if implemented else "superseded", now, previous["id"]))
+
+
 TELEMETRY_SOURCE = {"GCP": "GCP Audit Logs", "AWS": "AWS CloudTrail", "Azure": "Azure Activity Log"}
 CARRIED_STATUSES = ("accepted", "remediating", "incident", "dismissed")
 SCANS_GUARD = threading.Lock()
@@ -1218,7 +1347,23 @@ def execute_scan(credential_id: int, actor: str) -> dict[str, Any]:
                 item["lastReviewedAt"] = decided
         telemetry_status = discovered.get("telemetryStatus", "collected" if events else "not_collected")
         projects = discovered.get("projects", [])
+        service_accounts = [item for item in discovered.get("serviceAccounts", []) if isinstance(item, dict) and item.get("id")]
+        oldest_key = {}
+        for account in service_accounts:
+            active = sorted(key["createdAt"] for key in account.get("keys", []) if not key.get("disabled") and key.get("createdAt"))
+            if active:
+                oldest_key[account["id"]] = active[0]
+        for item in identities:
+            if str(item["id"]) in oldest_key and not item.get("accessKeyCreatedAt"):
+                item["accessKeyCreatedAt"] = oldest_key[str(item["id"])]
         findings = evaluate_rules(identities, accesses, events, settings["rules"], row["provider"])
+        accounts_by_project: dict[str, list[str]] = {}
+        for account in service_accounts:
+            accounts_by_project.setdefault(str(account.get("projectId")), []).append(account["id"])
+        edges = impersonation_edges(accesses, discovered.get("impersonation", []), accounts_by_project)
+        findings += impersonation_findings(identities, accesses, edges, settings)
+        recommendations = build_recommendations(row["provider"], identities, accesses, discovered.get("recommendations", []),
+                                                lambda role: role_context(row["provider"], role, "project")["severity"])
         risk_score_value = calculate_risk_score(findings, len(identities) + len(accesses))
         cursor = connection.execute(
             "INSERT INTO scans(credential_id,provider,status,started_at) VALUES(?,?,?,?) RETURNING id",
@@ -1237,7 +1382,21 @@ def execute_scan(credential_id: int, actor: str) -> dict[str, Any]:
         connection.execute("DELETE FROM access_grants WHERE credential_id=?", (credential_id,))
         connection.execute("DELETE FROM cloud_resources WHERE credential_id=?", (credential_id,))
         connection.execute("DELETE FROM telemetry_events WHERE credential_id=?", (credential_id,))
+        connection.execute("DELETE FROM service_accounts WHERE credential_id=?", (credential_id,))
+        connection.execute("DELETE FROM impersonation_edges WHERE credential_id=?", (credential_id,))
         connection.execute("UPDATE findings SET status='superseded' WHERE credential_id=? AND status NOT IN ('superseded','resolved')", (credential_id,))
+        for account in service_accounts:
+            connection.execute(
+                """INSERT INTO service_accounts(credential_id,external_id,email,project_id,display_name,description,disabled,keys_json,
+                   created_by,created_at,owner_hint) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (credential_id, account["id"], account.get("email") or account["id"], account.get("projectId"), account.get("displayName"),
+                 account.get("description"), int(bool(account.get("disabled"))), json.dumps(account.get("keys", [])),
+                 account.get("createdBy"), account.get("createdAt"), account.get("ownerHint")))
+        for edge in edges:
+            connection.execute(
+                "INSERT INTO impersonation_edges(credential_id,source,target,role,scope,resource_id) VALUES(?,?,?,?,?,?)",
+                (credential_id, edge["source"], edge["target"], edge["role"], edge["scope"], edge.get("resourceId")))
+        store_recommendations(connection, credential_id, recommendations, accesses)
         for item in identities:
             connection.execute(
                 """INSERT INTO identities(credential_id,external_id,display_name,identity_type,email,enabled,
@@ -1287,9 +1446,9 @@ def execute_scan(credential_id: int, actor: str) -> dict[str, Any]:
             )
         finished_at = utc_now()
         connection.execute(
-            "UPDATE scans SET status='completed',identity_count=?,access_count=?,finding_count=?,telemetry_event_count=?,telemetry_status=?,usage_status=?,risk_score=?,finished_at=? WHERE id=?",
+            "UPDATE scans SET status='completed',identity_count=?,access_count=?,finding_count=?,telemetry_event_count=?,telemetry_status=?,usage_status=?,usage_detail=?,risk_score=?,finished_at=? WHERE id=?",
             (len(identities), len(accesses), len(findings), len(events), telemetry_status,
-             discovered.get("usageStatus", "not_collected"), risk_score_value, finished_at, scan_id),
+             discovered.get("usageStatus", "not_collected"), discovered.get("usageDetail") or None, risk_score_value, finished_at, scan_id),
         )
         scope = f"{len(projects)} projetos/contas · {len(identities)} identidades · {len(accesses)} acessos"
         expires_at = discovered.get("expiresAt") or row["expires_at"]
@@ -2774,7 +2933,8 @@ def update_settings(payload: SettingsInput, request: Request) -> dict[str, Any]:
         raise HTTPException(422, "O webhook precisa ser uma URL https://")
     settings = {"rules": rules, "schedule": payload.schedule, "webhook": webhook,
                 "notifications": {key: bool(payload.notifications.get(key, default))
-                                  for key, default in DEFAULT_SETTINGS["notifications"].items()}}
+                                  for key, default in DEFAULT_SETTINGS["notifications"].items()},
+                "corporateDomains": sorted({item.strip().lower().lstrip("@") for item in payload.corporateDomains if item.strip()})}
     with db() as connection:
         before = load_settings(connection)
         store_settings(connection, settings)
@@ -2785,6 +2945,260 @@ def update_settings(payload: SettingsInput, request: Request) -> dict[str, Any]:
               details={"schedule": payload.schedule, "changedRules": changed, "notifications": settings["notifications"],
                        "webhookConfigured": bool(webhook)})
     return get_settings()
+
+
+# ── Menor privilégio ──────────────────────────────────────────────────────────────────────────
+
+def recommendation_view(row: Any) -> dict[str, Any]:
+    return {"id": row["id"], "credentialId": row["credential_id"], "provider": row["provider"], "identityId": row["identity_external_id"],
+            "identityName": row["identity_name"], "identityType": row["identity_type"], "resourceId": row["resource_id"],
+            "resourceName": row["resource_name"], "role": row["granted_role"], "action": row["action"],
+            "actionLabel": ACTION_LABEL.get(row["action"], row["action"]), "suggestedRoles": json.loads(row["suggested_json"]),
+            "reason": row["reason"], "source": row["source"], "privileged": bool(row["privileged"]), "severity": row["severity"],
+            "command": row["command"], "status": row["status"], "statusNote": row["status_note"], "firstSeenAt": row["first_seen_at"],
+            "lastSeenAt": row["last_seen_at"], "resolvedAt": row["resolved_at"]}
+
+
+@app.get("/api/recommendations/summary")
+def recommendations_summary(credential_id: int | None = None) -> dict[str, Any]:
+    clause, params = (" AND credential_id=?", (credential_id,)) if credential_id is not None else ("", ())
+    with db() as connection:
+        rows = connection.execute(f"SELECT status,action,source,privileged,granted_role FROM recommendations WHERE 1=1{clause}", params).fetchall()
+        privileged_total = connection.execute(f"SELECT COUNT(*) count FROM access_grants WHERE privileged=1{clause}", params).fetchone()["count"]
+        usage = connection.execute(
+            f"""SELECT usage_status FROM scans WHERE id IN (SELECT MAX(id) FROM scans WHERE status='completed'{clause} GROUP BY credential_id)""",
+            params).fetchall()
+    open_rows = [row for row in rows if row["status"] == "open"]
+    return {"open": len(open_rows), "privilegedOpen": sum(1 for row in open_rows if row["privileged"]),
+            "privilegedTotal": privileged_total,
+            "byAction": {action: sum(1 for row in open_rows if row["action"] == action) for action in ("remove", "replace", "move_to_group")},
+            "basicRoles": sum(1 for row in open_rows if row["granted_role"] in {"roles/owner", "roles/editor", "roles/viewer"}),
+            "fromProvider": sum(1 for row in open_rows if row["source"].startswith("Google")),
+            "implemented": sum(1 for row in rows if row["status"] == "resolved"),
+            "dismissed": sum(1 for row in rows if row["status"] == "dismissed"),
+            "recommenderAvailable": any((row["usage_status"] or "") in {"collected", "partial"} for row in usage)}
+
+
+@app.get("/api/recommendations")
+def list_recommendations(credential_id: int | None = None, status_filter: str = Query("open", alias="status"),
+                         limit: int = Query(5000, ge=1, le=20000)) -> list[dict[str, Any]]:
+    clauses, params = ["1=1"], []
+    if credential_id is not None:
+        clauses.append("credential_id=?")
+        params.append(credential_id)
+    if status_filter != "all":
+        clauses.append("status=?")
+        params.append(status_filter)
+    params.append(limit)
+    with db() as connection:
+        rows = connection.execute(
+            f"""SELECT * FROM recommendations WHERE {' AND '.join(clauses)}
+                ORDER BY privileged DESC, CASE severity WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 ELSE 4 END, identity_name LIMIT ?""",
+            tuple(params)).fetchall()
+    return [recommendation_view(row) for row in rows]
+
+
+@app.patch("/api/recommendations/{recommendation_id}")
+def update_recommendation(recommendation_id: int, payload: RecommendationUpdate, request: Request) -> dict[str, Any]:
+    if payload.status == "dismissed" and not payload.justification:
+        raise HTTPException(422, "Informe a justificativa para descartar a recomendação.")
+    with db() as connection:
+        row = connection.execute("SELECT * FROM recommendations WHERE id=?", (recommendation_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Recomendação não encontrada")
+        connection.execute("UPDATE recommendations SET status=?,status_note=? WHERE id=?", (payload.status, payload.justification, recommendation_id))
+        audit(connection, "risk", "Recomendação de menor privilégio " + ("descartada" if payload.status == "dismissed" else "reaberta"),
+              f"{row['identity_name']} · {row['granted_role']} em {row['resource_name']}. {payload.justification or ''}".strip(),
+              request.state.user["email"], action=f"recommendation.{payload.status}", target=f"{row['identity_name']} · {row['granted_role']}",
+              details={"action": row["action"], "source": row["source"], "justification": payload.justification or ""})
+        return recommendation_view(connection.execute("SELECT * FROM recommendations WHERE id=?", (recommendation_id,)).fetchone())
+
+
+# ── Identidades não humanas ───────────────────────────────────────────────────────────────────
+
+def nhi_inventory(connection: DatabaseConnection, credential_id: int | None = None) -> list[dict[str, Any]]:
+    clause, params = (" AND credential_id=?", (credential_id,)) if credential_id is not None else ("", ())
+    limits = load_settings(connection)["rules"]
+    credentials = {row["id"]: row for row in connection.execute("SELECT id,name,provider FROM credentials").fetchall()}
+    accounts = {(row["credential_id"], row["external_id"]): row for row in connection.execute(
+        f"SELECT * FROM service_accounts WHERE 1=1{clause}", params).fetchall()}
+    identities = {(row["credential_id"], row["external_id"]): row for row in connection.execute(
+        f"SELECT * FROM identities WHERE 1=1{clause}", params).fetchall()}
+    grants: dict[tuple[int, str], list[Any]] = {}
+    for row in connection.execute(f"SELECT credential_id,identity_external_id,role_name,privileged FROM access_grants WHERE 1=1{clause}", params).fetchall():
+        grants.setdefault((row["credential_id"], row["identity_external_id"]), []).append(row)
+    inbound: dict[tuple[int, str], int] = {}
+    outbound: dict[tuple[int, str], int] = {}
+    for row in connection.execute(f"SELECT credential_id,source,target FROM impersonation_edges WHERE 1=1{clause}", params).fetchall():
+        inbound[(row["credential_id"], row["target"])] = inbound.get((row["credential_id"], row["target"]), 0) + 1
+        outbound[(row["credential_id"], row["source"])] = outbound.get((row["credential_id"], row["source"]), 0) + 1
+    risk = {(row["credential_id"], row["identity_external_id"]): row["weight"] for row in connection.execute(
+        f"""SELECT credential_id,identity_external_id,SUM({RISK_WEIGHT_SQL}) weight FROM findings f WHERE status='open'{clause}
+            GROUP BY credential_id,identity_external_id""", params).fetchall()}
+    key_telemetry = {cid for (cid, _), row in accounts.items() if any(key.get("lastUsedAt") for key in json.loads(row["keys_json"]))}
+    key_telemetry |= {cid for cid, row in credentials.items() if row["provider"] == "AWS"}
+    keys = set(accounts) | {key for key, row in identities.items() if row["identity_type"] == "service"}
+    items = []
+    for key in keys:
+        cid, external = key
+        if cid not in credentials:
+            continue
+        identity = identities.get(key)
+        account = accounts.get(key)
+        provider = credentials[cid]["provider"]
+        account_view = {"ownerHint": account["owner_hint"], "createdBy": account["created_by"]} if account else None
+        owner, owner_source = owner_of({"id": external, "owner": identity["owner"] if identity else None}, account_view)
+        key_list = json.loads(account["keys_json"]) if account else []
+        active_keys = [item for item in key_list if not item.get("disabled")]
+        ages = [days_ago(item.get("createdAt")) for item in active_keys if item.get("createdAt")]
+        last_candidates = [value for value in ([identity["last_seen_at"]] if identity else []) + [item.get("lastUsedAt") for item in key_list] if value]
+        last_used = max(last_candidates) if last_candidates else None
+        roles = [row["role_name"] for row in grants.get(key, [])]
+        managed = "Gerenciada pelo Google" if is_google_managed(external) else (
+            "Role IAM" if ":role/" in external else "Usuário IAM com chave" if provider == "AWS" else
+            "Identidade gerenciada" if provider == "Azure" else "Gerenciada pelo usuário")
+        item = {"id": external, "credentialId": cid, "provider": provider, "environment": credentials[cid]["name"],
+                "name": member_name(external), "displayName": (account["display_name"] if account else None) or (identity["display_name"] if identity else ""),
+                "project": account["project_id"] if account else None, "kind": managed, "aiKind": ai_kind(external, roles),
+                "owner": owner, "ownerSource": owner_source, "createdBy": account["created_by"] if account else None,
+                "createdAt": account["created_at"] if account else None, "disabled": bool(account["disabled"]) if account else False,
+                "activeKeys": len(active_keys), "oldestKeyDays": max(ages) if ages else None,
+                "unusedKeys": sum(1 for item in active_keys if not item.get("lastUsedAt")) if cid in key_telemetry else 0,
+                "lastUsedAt": last_used, "lastUsedDays": days_ago(last_used),
+                "grantCount": len(roles), "privilegedCount": sum(1 for row in grants.get(key, []) if row["privileged"]),
+                "impersonators": inbound.get(key, 0), "canImpersonate": outbound.get(key, 0),
+                "riskScore": min(100, int(risk.get(key) or 0)), "identityDbId": identity["id"] if identity else None}
+        item["flags"] = nhi_flags(item, limits["key_age_days"], limits["unused_days"])
+        items.append(item)
+    return sorted(items, key=lambda entry: (-entry["riskScore"], -len(entry["flags"]), -entry["privilegedCount"], entry["name"]))
+
+
+@app.get("/api/nhi/summary")
+def nhi_summary(credential_id: int | None = None) -> dict[str, Any]:
+    with db() as connection:
+        items = nhi_inventory(connection, credential_id)
+        limits = load_settings(connection)["rules"]
+    user_managed = [item for item in items if item["kind"] != "Gerenciada pelo Google"]
+    return {"total": len(items), "userManaged": len(user_managed), "googleManaged": len(items) - len(user_managed),
+            "withKeys": sum(1 for item in items if item["activeKeys"]), "activeKeys": sum(item["activeKeys"] for item in items),
+            "oldKeys": sum(1 for item in items if item["oldestKeyDays"] is not None and item["oldestKeyDays"] > limits["key_age_days"]),
+            "keyAgeDays": limits["key_age_days"], "unusedDays": limits["unused_days"],
+            "noOwner": sum(1 for item in user_managed if not item["owner"]),
+            "privileged": sum(1 for item in items if item["privilegedCount"]),
+            "ai": sum(1 for item in items if item["aiKind"]), "impersonable": sum(1 for item in items if item["impersonators"]),
+            "unused": sum(1 for item in items if item["lastUsedDays"] is not None and item["lastUsedDays"] > limits["unused_days"]),
+            "usageKnown": sum(1 for item in items if item["lastUsedAt"])}
+
+
+@app.get("/api/nhi")
+def nhi_list(credential_id: int | None = None) -> list[dict[str, Any]]:
+    with db() as connection:
+        return nhi_inventory(connection, credential_id)
+
+
+@app.get("/api/nhi/detail")
+def nhi_detail(credential_id: int, identity: str) -> dict[str, Any]:
+    with db() as connection:
+        item = next((entry for entry in nhi_inventory(connection, credential_id) if entry["id"] == identity), None)
+        if not item:
+            raise HTTPException(404, "Identidade não humana não encontrada")
+        account = connection.execute("SELECT keys_json,description FROM service_accounts WHERE credential_id=? AND external_id=?",
+                                     (credential_id, identity)).fetchone()
+        grants = connection.execute("SELECT resource_name,resource_id,role_name,privileged FROM access_grants WHERE credential_id=? AND identity_external_id=? ORDER BY privileged DESC,resource_name",
+                                    (credential_id, identity)).fetchall()
+        impersonators = connection.execute("SELECT source,role,scope,resource_id FROM impersonation_edges WHERE credential_id=? AND target=?",
+                                           (credential_id, identity)).fetchall()
+    return {**item, "description": account["description"] if account else "", "keys": json.loads(account["keys_json"]) if account else [],
+            "grants": [{"resource": row["resource_name"], "resourceId": row["resource_id"], "role": row["role_name"], "privileged": bool(row["privileged"])} for row in grants],
+            "impersonatedBy": [{"source": row["source"], "name": member_name(row["source"]), "role": row["role"], "scope": row["scope"],
+                                "resourceId": row["resource_id"]} for row in impersonators]}
+
+
+# ── Grafo de acesso ───────────────────────────────────────────────────────────────────────────
+
+def graph_context(connection: DatabaseConnection, credential_id: int | None = None) -> dict[str, Any]:
+    """Graph over all credentials; nodes are namespaced by credential so equal principals in different clouds never merge."""
+    clause, params = (" AND credential_id=?", (credential_id,)) if credential_id is not None else ("", ())
+    settings = load_settings(connection)
+    identities_rows = connection.execute(f"SELECT credential_id,external_id,display_name,identity_type,email FROM identities WHERE 1=1{clause}", params).fetchall()
+    identities = {f"{row['credential_id']}|{row['external_id']}": {"id": row["external_id"], "name": row["display_name"], "type": row["identity_type"],
+                                                                    "email": row["email"], "credentialId": row["credential_id"]} for row in identities_rows}
+    accesses = [{"identityId": f"{row['credential_id']}|{row['identity_external_id']}", "resourceId": row["resource_id"],
+                 "resourceName": row["resource_name"], "role": row["role_name"], "privileged": bool(row["privileged"]), "credentialId": row["credential_id"]}
+                for row in connection.execute(f"SELECT credential_id,identity_external_id,resource_id,resource_name,role_name,privileged FROM access_grants WHERE 1=1{clause}", params).fetchall()]
+    edges = [{"source": f"{row['credential_id']}|{row['source']}", "target": f"{row['credential_id']}|{row['target']}", "role": row["role"],
+              "scope": row["scope"], "resourceId": row["resource_id"]}
+             for row in connection.execute(f"SELECT credential_id,source,target,role,scope,resource_id FROM impersonation_edges WHERE 1=1{clause}", params).fetchall()]
+    domains = corporate_domains(list(identities.values()), settings.get("corporateDomains", []))
+    return {"graph": AccessGraph(accesses, edges), "identities": identities, "domains": domains, "edges": edges}
+
+
+def split_node(node: str) -> tuple[int, str]:
+    credential, _, identity = node.partition("|")
+    return int(credential), identity
+
+
+def path_view(path: dict[str, Any], identities: dict[str, Any]) -> dict[str, Any]:
+    credential_id, source = split_node(path["source"])
+    info = identities.get(path["source"], {})
+    return {"credentialId": credential_id, "source": source, "sourceName": info.get("name") or member_name(source),
+            "sourceType": path["sourceType"], "external": path["external"], "severity": path["severity"],
+            "steps": [{"target": split_node(step["target"])[1], "name": member_name(split_node(step["target"])[1]), "role": step["role"],
+                       "verb": IMPERSONATION_VERBS.get(step["role"], "personificar"), "scope": step["scope"]} for step in path["chain"]],
+            "role": path["role"], "resourceId": path["resourceId"], "resourceName": path["resourceName"]}
+
+
+@app.get("/api/graph/summary")
+def graph_summary(credential_id: int | None = None) -> dict[str, Any]:
+    with db() as connection:
+        context = graph_context(connection, credential_id)
+    graph, identities = context["graph"], context["identities"]
+    paths = graph.escalation_paths(identities, context["domains"], limit=20000)
+    blast = []
+    for node in {grant_owner for grant_owner in graph.grants} | set(graph.out):
+        reach = graph.reach(node)
+        if reach["privilegedIndirect"] or reach["indirectResources"]:
+            credential_id_, identity = split_node(node)
+            info = identities.get(node, {})
+            blast.append({"credentialId": credential_id_, "identity": identity, "name": info.get("name") or member_name(identity),
+                          "type": info.get("type"), "directResources": reach["directResources"], "indirectResources": reach["indirectResources"],
+                          "privilegedDirect": reach["privilegedDirect"], "privilegedIndirect": reach["privilegedIndirect"],
+                          "accounts": len(reach["accounts"])})
+    blast.sort(key=lambda item: (-item["privilegedIndirect"], -item["indirectResources"], item["name"]))
+    return {"edges": len(context["edges"]), "sources": len(graph.out),
+            "targets": len({edge["target"] for edge in context["edges"]}),
+            "paths": len(paths), "critical": sum(1 for path in paths if path["severity"] == "critical"),
+            "external": sum(1 for path in paths if path["external"]),
+            "identitiesWithPaths": len({path["source"] for path in paths}),
+            "topBlast": blast[:12], "domains": context["domains"]}
+
+
+@app.get("/api/graph/paths")
+def graph_paths(credential_id: int | None = None, limit: int = Query(2000, ge=1, le=20000)) -> list[dict[str, Any]]:
+    with db() as connection:
+        context = graph_context(connection, credential_id)
+    paths = context["graph"].escalation_paths(context["identities"], context["domains"], limit=limit)
+    return [path_view(path, context["identities"]) for path in paths]
+
+
+@app.get("/api/graph/identity")
+def graph_identity(credential_id: int, identity: str) -> dict[str, Any]:
+    with db() as connection:
+        context = graph_context(connection, credential_id)
+    graph, node = context["graph"], f"{credential_id}|{identity}"
+    reach = graph.reach(node)
+    return {"identity": identity, "directResources": reach["directResources"], "indirectResources": reach["indirectResources"],
+            "privilegedDirect": reach["privilegedDirect"], "privilegedIndirect": reach["privilegedIndirect"],
+            "canImpersonate": [{"target": split_node(target)[1], "name": member_name(split_node(target)[1]),
+                                "chain": [{"name": member_name(split_node(edge["target"])[1]), "role": edge["role"],
+                                           "verb": IMPERSONATION_VERBS.get(edge["role"], "personificar")} for edge in chain]}
+                               for target, chain in sorted(reach["accounts"].items(), key=lambda entry: len(entry[1]))][:50],
+            "indirect": [{"resource": item["grant"]["resourceName"], "role": item["grant"]["role"], "privileged": item["grant"]["privileged"],
+                          "via": [member_name(split_node(edge["target"])[1]) for edge in item["chain"]]}
+                         for item in sorted(reach["indirect"], key=lambda entry: not entry["grant"]["privileged"])][:100],
+            "impersonatedBy": [{"source": split_node(edge["source"])[1], "name": member_name(split_node(edge["source"])[1]), "role": edge["role"],
+                                "verb": IMPERSONATION_VERBS.get(edge["role"], "personificar"), "scope": edge["scope"]}
+                               for edge in graph.inbound.get(node, [])][:100]}
 
 
 @app.get("/api/scans")

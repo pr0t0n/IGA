@@ -502,5 +502,83 @@ class PlatformEndToEndTest(unittest.TestCase):
             self.assertEqual(self.client.delete(f"/api/credentials/{item}").status_code, 204)
 
 
+    def test_least_privilege_nhi_and_access_graph(self):
+        project = "proj-graph"
+        discovery = {
+            "projects": [{"id": project, "name": "Graph", "type": "project"}],
+            "identities": [
+                {"id": "user:dev@corp.com", "name": "dev@corp.com", "email": "dev@corp.com", "type": "user"},
+                {"id": "user:ana@corp.com", "name": "ana@corp.com", "email": "ana@corp.com", "type": "user"},
+                {"id": "serviceAccount:deployer@proj-graph.iam.gserviceaccount.com", "name": "deployer", "type": "service"},
+                {"id": "deleted:user:old@corp.com?uid=9", "name": "old@corp.com", "type": "deleted"},
+            ],
+            "accesses": [
+                {"identityId": "user:dev@corp.com", "resourceId": project, "resourceName": "Graph", "role": "roles/iam.serviceAccountTokenCreator", "permissions": []},
+                {"identityId": "user:ana@corp.com", "resourceId": project, "resourceName": "Graph", "role": "roles/owner", "permissions": [], "privileged": True},
+                {"identityId": "serviceAccount:deployer@proj-graph.iam.gserviceaccount.com", "resourceId": project, "resourceName": "Graph",
+                 "role": "roles/owner", "permissions": [], "privileged": True},
+                {"identityId": "deleted:user:old@corp.com?uid=9", "resourceId": project, "resourceName": "Graph", "role": "roles/viewer", "permissions": []},
+            ],
+            "events": [],
+            "serviceAccounts": [{"id": "serviceAccount:deployer@proj-graph.iam.gserviceaccount.com", "email": "deployer@proj-graph.iam.gserviceaccount.com",
+                                 "projectId": project, "displayName": "Deployer", "description": "", "disabled": False,
+                                 "keys": [{"id": "k1", "createdAt": "2024-01-01T00:00:00Z", "disabled": False, "expiresAt": None, "lastUsedAt": None}],
+                                 "createdBy": "ana@corp.com", "createdAt": "2025-01-01T00:00:00Z", "ownerHint": None}],
+            "impersonation": [],
+            "recommendations": [],
+        }
+        credential_id = self.client.post("/api/credentials", json={"name": "Graph GCP", "provider": "GCP", "credential": {
+            "type": "service_account", "project_id": project, "private_key": "k", "client_email": "reader@proj-graph.iam.gserviceaccount.com"}}).json()["id"]
+        with patch("main.discover", return_value=discovery):
+            self.assertEqual(self.client.post(f"/api/credentials/{credential_id}/scan").status_code, 200)
+
+        findings = self.client.get(f"/api/findings?credential_id={credential_id}").json()
+        path_finding = next(item for item in findings if item["rule"] == "IMPERSONATION_PATH")
+        self.assertEqual(path_finding["identityId"], "user:dev@corp.com")
+        self.assertIn("emitir tokens como deployer@proj-graph.iam.gserviceaccount.com", path_finding["description"])
+        self.assertTrue(any(item["title"] == "Chave de acesso antiga" for item in findings))
+
+        recs = self.client.get(f"/api/recommendations?credential_id={credential_id}").json()
+        actions = {(item["identityId"], item["role"]): item["action"] for item in recs}
+        self.assertEqual(actions[("deleted:user:old@corp.com?uid=9", "roles/viewer")], "remove")
+        self.assertEqual(actions[("user:ana@corp.com", "roles/owner")], "move_to_group")
+        self.assertEqual(actions[("serviceAccount:deployer@proj-graph.iam.gserviceaccount.com", "roles/owner")], "replace")
+        deleted = next(item for item in recs if item["identityId"].startswith("deleted:"))
+        self.assertEqual(self.client.patch(f"/api/recommendations/{deleted['id']}", json={"status": "dismissed"}).status_code, 422)
+        ana = next(item for item in recs if item["identityId"] == "user:ana@corp.com")
+        self.assertEqual(self.client.patch(f"/api/recommendations/{ana['id']}", json={"status": "dismissed", "justification": "Dona do projeto"}).json()["status"], "dismissed")
+
+        cleaned = {**discovery, "accesses": [item for item in discovery["accesses"] if not item["identityId"].startswith("deleted:")],
+                   "identities": [item for item in discovery["identities"] if item["type"] != "deleted"]}
+        with patch("main.discover", return_value=cleaned):
+            self.assertEqual(self.client.post(f"/api/credentials/{credential_id}/scan").status_code, 200)
+        summary = self.client.get(f"/api/recommendations/summary?credential_id={credential_id}").json()
+        self.assertEqual((summary["implemented"], summary["dismissed"]), (1, 1))
+        self.assertEqual(self.client.get(f"/api/recommendations?credential_id={credential_id}&status=resolved").json()[0]["identityId"],
+                         "deleted:user:old@corp.com?uid=9")
+
+        nhi = self.client.get(f"/api/nhi?credential_id={credential_id}").json()
+        deployer = next(item for item in nhi if item["id"].startswith("serviceAccount:deployer"))
+        self.assertEqual((deployer["owner"], deployer["ownerSource"]), ("ana@corp.com", "Criou a conta (logs de auditoria)"))
+        self.assertEqual((deployer["activeKeys"], deployer["impersonators"], deployer["privilegedCount"]), (1, 1, 1))
+        self.assertGreater(deployer["oldestKeyDays"], 90)
+        detail = self.client.get("/api/nhi/detail", params={"credential_id": credential_id, "identity": deployer["id"]}).json()
+        self.assertEqual(detail["impersonatedBy"][0]["source"], "user:dev@corp.com")
+        nhi_summary = self.client.get(f"/api/nhi/summary?credential_id={credential_id}").json()
+        self.assertEqual((nhi_summary["withKeys"], nhi_summary["oldKeys"], nhi_summary["impersonable"]), (1, 1, 1))
+
+        graph = self.client.get(f"/api/graph/summary?credential_id={credential_id}").json()
+        self.assertEqual((graph["paths"], graph["edges"]), (1, 1))
+        self.assertEqual(graph["topBlast"][0]["identity"], "user:dev@corp.com")
+        paths = self.client.get(f"/api/graph/paths?credential_id={credential_id}").json()
+        self.assertEqual(paths[0]["steps"][0]["name"], "deployer@proj-graph.iam.gserviceaccount.com")
+        reach = self.client.get("/api/graph/identity", params={"credential_id": credential_id, "identity": "user:dev@corp.com"}).json()
+        self.assertEqual((reach["privilegedIndirect"], reach["canImpersonate"][0]["name"]), (1, "deployer@proj-graph.iam.gserviceaccount.com"))
+        frameworks = self.client.get(f"/api/compliance/frameworks?credential_id={credential_id}").json()["frameworks"]
+        cis = next(item for item in frameworks if item["key"] == "cis")
+        self.assertEqual(next(item for item in cis["controls"] if item["id"] == "1.6 (GCP)")["status"], "Não atendido")
+        self.assertEqual(self.client.delete(f"/api/credentials/{credential_id}").status_code, 204)
+
+
 if __name__ == "__main__":
     unittest.main()

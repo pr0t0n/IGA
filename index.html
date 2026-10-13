@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="modernist.css?v=20261008-r7">
+  <link rel="stylesheet" href="modernist.css?v=20261008-r8">
 </head>
 <body class="locked" data-page="dashboard">
   <div class="app">
@@ -95,6 +95,76 @@
         </div>
         <div class="band">
           <section class="cell flush" data-flex="2.4 1 640px"><div class="table-wrap" id="acc-table"></div><div class="foot-text" id="acc-foot"></div></section>
+        </div>
+      </section>
+
+      <!-- Identidades não humanas -->
+      <section id="nhi" class="page" aria-labelledby="nhi-title">
+        <div class="page-head">
+          <div class="page-head-copy"><div class="eyebrow">Non-Human Identities</div><h1 id="nhi-title">Identidades não humanas</h1><div class="lead">Service accounts, roles, chaves e agentes de IA: quem é o responsável, quem pode personificá-las e há quanto tempo as chaves existem.</div></div>
+          <div class="head-actions"><button type="button" class="btn btn-secondary" id="nhi-export">Exportar CSV</button></div>
+        </div>
+        <div class="band top stats" id="nhi-kpis"></div>
+        <div class="filters">
+          <div class="seg" role="radiogroup" aria-label="Filtro" id="nhi-filters">
+            <label class="seg-opt"><input type="radio" name="nhi-filter" value="all" checked>Todas</label>
+            <label class="seg-opt"><input type="radio" name="nhi-filter" value="keys">Com chave</label>
+            <label class="seg-opt"><input type="radio" name="nhi-filter" value="oldkeys">Chave antiga</label>
+            <label class="seg-opt"><input type="radio" name="nhi-filter" value="noowner">Sem responsável</label>
+            <label class="seg-opt"><input type="radio" name="nhi-filter" value="impersonable">Personificáveis</label>
+            <label class="seg-opt"><input type="radio" name="nhi-filter" value="ai">IA</label>
+            <label class="seg-opt"><input type="radio" name="nhi-filter" value="privileged">Privilegiadas</label>
+          </div>
+          <input class="input grow" id="nhi-search" type="search" placeholder="Buscar conta, projeto ou responsável" aria-label="Buscar identidades não humanas">
+          <span class="count-text" id="nhi-count"></span>
+        </div>
+        <div class="band">
+          <section class="cell flush" data-flex="2 1 620px"><div class="table-wrap" id="nhi-table"></div><div class="foot-text" id="nhi-foot"></div></section>
+          <aside class="cell gap-16" data-flex="1 1 340px" id="nhi-aside" hidden></aside>
+        </div>
+      </section>
+
+      <!-- Menor privilégio -->
+      <section id="menorprivilegio" class="page" aria-labelledby="lp-title">
+        <div class="page-head">
+          <div class="page-head-copy"><div class="eyebrow">Least Privilege · CIEM</div><h1 id="lp-title">Menor privilégio</h1><div class="lead">Recomendações para reduzir permissões sem quebrar o que é usado. A plataforma não altera o ambiente: cada recomendação traz o comando para o responsável aplicar, e a próxima análise comprova a implementação.</div></div>
+          <div class="head-actions"><button type="button" class="btn btn-secondary" id="lp-export-csv">Exportar CSV</button><button type="button" class="btn btn-primary" id="lp-export-script">Exportar script</button></div>
+        </div>
+        <div class="band top stats" id="lp-kpis"></div>
+        <div class="filters">
+          <div class="seg" role="radiogroup" aria-label="Situação">
+            <label class="seg-opt"><input type="radio" name="lp-status" value="open" checked>Abertas</label>
+            <label class="seg-opt"><input type="radio" name="lp-status" value="resolved">Implementadas</label>
+            <label class="seg-opt"><input type="radio" name="lp-status" value="dismissed">Descartadas</label>
+          </div>
+          <div class="seg" role="radiogroup" aria-label="Ação">
+            <label class="seg-opt"><input type="radio" name="lp-action" value="all" checked>Todas</label>
+            <label class="seg-opt"><input type="radio" name="lp-action" value="remove">Remover</label>
+            <label class="seg-opt"><input type="radio" name="lp-action" value="replace">Substituir</label>
+            <label class="seg-opt"><input type="radio" name="lp-action" value="move_to_group">Mover para grupo</label>
+          </div>
+          <input class="input grow" id="lp-search" type="search" placeholder="Buscar identidade, recurso ou papel" aria-label="Buscar recomendações">
+          <span class="count-text" id="lp-count"></span>
+        </div>
+        <div class="band">
+          <section class="cell flush" data-flex="2 1 620px"><div class="table-wrap" id="lp-table"></div><div class="foot-text" id="lp-foot"></div></section>
+          <aside class="cell gap-16" data-flex="1 1 360px" id="lp-aside" hidden></aside>
+        </div>
+      </section>
+
+      <!-- Caminhos de acesso -->
+      <section id="caminhos" class="page" aria-labelledby="graph-title">
+        <div class="page-head">
+          <div class="page-head-copy"><div class="eyebrow">Access Graph</div><h1 id="graph-title">Caminhos de acesso</h1><div class="lead">Quem chega a privilégios indiretamente, personificando contas de serviço ou assumindo roles. Um caminho mostra cada passo da identidade de origem até o papel privilegiado.</div></div>
+        </div>
+        <div class="band top stats" id="graph-kpis"></div>
+        <div class="band">
+          <section class="cell gap-10" data-flex="1 1 340px" id="graph-blast"></section>
+          <section class="cell gap-12" data-flex="2.2 1 620px">
+            <div class="cell-head"><div><div class="card-kicker">Escalada</div><div class="card-title">Caminhos até privilégio</div></div><label class="check"><input type="checkbox" id="graph-external">Somente origem externa</label></div>
+            <div id="graph-paths"></div>
+            <div class="foot-text" id="graph-foot"></div>
+          </section>
         </div>
       </section>
 
@@ -238,6 +308,11 @@
               <label class="notif"><input type="checkbox" class="checkbox" data-notif="weekly"><span><b>Resumo semanal</b><small>Nota de risco, riscos ativos e novos no webhook</small></span></label>
               <div class="field"><label for="settings-webhook">Webhook (Slack / Teams)</label><input class="input" id="settings-webhook" type="url" placeholder="https://hooks.slack.com/services/…" autocomplete="off"></div>
             </div>
+            <div class="stack-10 divider-top">
+              <div class="card-title">Domínios corporativos</div>
+              <div class="field"><label for="settings-domains">Identidades fora destes domínios são tratadas como externas nos caminhos de acesso</label><input class="input" id="settings-domains" placeholder="empresa.com.br, empresa.com" autocomplete="off"></div>
+              <div class="muted-sm" id="settings-domains-hint"></div>
+            </div>
           </section>
         </div>
         <section class="section-flat">
@@ -352,6 +427,12 @@
     <div id="project-content" class="stack-12"></div>
   </dialog>
 
+  <!-- Raio de impacto de uma identidade -->
+  <dialog id="reach-modal" class="dialog dialog-lg" aria-labelledby="reach-title">
+    <div class="dialog-head"><div><div class="card-kicker">Raio de impacto</div><div class="dialog-title" id="reach-title">Identidade</div></div><button type="button" class="btn btn-icon" aria-label="Fechar" data-close><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"></path></svg></button></div>
+    <div id="reach-content" class="stack-12"></div>
+  </dialog>
+
   <!-- Convite: senha temporária -->
   <dialog id="invite-modal" class="dialog dialog-sm" aria-labelledby="invite-title">
     <div class="dialog-title" id="invite-title">Convite criado</div>
@@ -362,6 +443,6 @@
   </dialog>
 
   <div id="toast" role="status" aria-live="polite"></div>
-  <script src="app.js?v=20261008-r7"></script>
+  <script src="app.js?v=20261008-r8"></script>
 </body>
 </html>

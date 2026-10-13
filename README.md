@@ -65,6 +65,9 @@ Interface única no design system **Modernist** (Archivo, grade modular, réguas
 - **Visão geral** — nota de risco consolidada (0 = sem exposição, 100 = máxima), distribuição por severidade, risco por provedor (clique para filtrar), KPIs com variação no período, tendência de 7/30/90 dias, achados por regra, mapa de calor módulo × provedor, ambientes de maior risco, riscos prioritários, anomalias UEBA e atendimento por framework.
 - **Identidades** — KPIs (humanas, serviço, órfãs, sem MFA, inativas > 90 dias), filtros, nota de risco por identidade, painel lateral com sinais de risco e solicitação de revisão ao responsável; exportação CSV.
 - **Inventário de acessos** — concessões com origem (direta/grupo), último uso quando o provedor informa, curingas, visões por projeto (com drill-down projeto → papel → conta), por papel e por conta.
+- **Identidades não humanas** — contas de serviço, chaves de acesso e agentes de IA com responsável (tag, descrição ou log de criação), idade e último uso das chaves, privilégio e sinalizações (sem responsável, chave antiga, sem uso, privilégio administrativo).
+- **Menor privilégio** — recomendações de redução por concessão (remover, substituir por papel menor, mover para grupo) a partir das regras da plataforma e do Google Recommender quando disponível; dispensa exige justificativa auditada; exporta script `.sh` com os comandos para o time responsável executar.
+- **Caminhos de acesso** — grafo identidade → personificação/assume-role → papel → recurso, caminhos de escalada até papéis administrativos, alcance por identidade e acessos de domínios externos aos domínios corporativos.
 - **Inteligência e riscos** — abas por regra com descrição e critério, filtro por severidade, ações **Remediar**, **Aceitar** (com justificativa obrigatória) e **Reabrir**; o tratamento é preservado nas análises seguintes; leitura local do Qwen.
 - **Acesso privilegiado** — permanentes × JIT, papéis de alto impacto, MFA, uso, nota de exposição, **Converter para JIT** (solicitação registrada e auditada) e dossiê com análise local.
 - **UEBA** — eventos por hora (24 h) a partir dos logs coletados, categorias (escalada de privilégio, criação de credencial, acesso negado, horário atípico), esperado × observado, **Abrir incidente** e **Marcar como comportamento esperado**; diagnóstico de cobertura de telemetria.
@@ -91,9 +94,13 @@ O botão **Analisar** sempre utiliza o conector do provedor. A plataforma não a
 
 - AWS: STS, IAM e Organizations. Aceita access key ou assume-role com credenciais base disponíveis.
 - Azure: service principal, Subscriptions e RBAC.
-- GCP: service account, Resource Manager e políticas IAM dos projetos.
+- GCP: service account, Resource Manager, políticas IAM dos projetos e das contas de serviço, chaves, Recommender, Policy Analyzer e Cloud Audit Logs.
 
 Os conectores solicitam operações de leitura e toleram permissões opcionais indisponíveis quando possível.
+
+A plataforma é **somente informativa**: nunca altera IAM, chaves ou políticas dos provedores. Recomendações e scripts exportados são executados pelo time responsável, fora da plataforma.
+
+No GCP, as APIs IAM, Recommender e Policy Analyzer exigem o escopo OAuth `cloud-platform`; o acesso continua somente leitura porque é limitado pelos papéis concedidos à service account. Para o último uso das contas de serviço, habilite a **Policy Analyzer API** no projeto da credencial; quando o provedor recusa a chamada, o motivo informado aparece no Inventário de acessos.
 
 Endpoints de consulta:
 
@@ -108,6 +115,9 @@ Endpoints de consulta:
 - `GET /api/dashboard/overview?period=7|30|90&credential_id=&provider=`
 - `GET /api/identities/summary`, `GET /api/accesses/summary`, `GET /api/privileged-access/summary`
 - `POST /api/privileged-access/{id}/jit`
+- `GET /api/recommendations/summary`, `GET /api/recommendations?status=open|resolved|dismissed|all`, `PATCH /api/recommendations/{id}`
+- `GET /api/nhi/summary`, `GET /api/nhi`, `GET /api/nhi/detail?credential_id=&identity=`
+- `GET /api/graph/summary`, `GET /api/graph/paths`, `GET /api/graph/identity`
 - `GET /api/ueba/overview`
 - `GET /api/audit/trail`
 - `GET /api/compliance/frameworks`

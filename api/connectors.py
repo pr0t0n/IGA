@@ -261,6 +261,8 @@ def discover_aws(credential: dict[str, Any], scopes: list[str] | None = None) ->
     identities: list[dict[str, Any]] = []
     accesses: list[dict[str, Any]] = []
     usage_reads = {"ok": 0, "denied": 0}
+    service_accounts: list[dict[str, Any]] = []
+    impersonation: list[dict[str, Any]] = []
 
     for page in iam.get_paginator("list_users").paginate():
         for user in page.get("Users", []):
@@ -272,13 +274,24 @@ def discover_aws(credential: dict[str, Any], scopes: list[str] | None = None) ->
                            if key.get("Status") == "Active" and key.get("CreateDate")]
             key_dates = [key["CreateDate"] for key in active_keys]
             activity = [user.get("PasswordLastUsed")]
+            parsed_keys = []
             for key in active_keys:
+                key_used = None
                 try:
-                    activity.append(iam.get_access_key_last_used(AccessKeyId=key["AccessKeyId"])["AccessKeyLastUsed"].get("LastUsedDate"))
+                    key_used = iam.get_access_key_last_used(AccessKeyId=key["AccessKeyId"])["AccessKeyLastUsed"].get("LastUsedDate")
                     usage_reads["ok"] += 1
                 except Exception:
                     usage_reads["denied"] += 1
+                key_used = key_used if isinstance(key_used, datetime) else None
+                activity.append(key_used)
+                parsed_keys.append({"id": str(key.get("AccessKeyId", "")), "createdAt": iso(key.get("CreateDate")) if isinstance(key.get("CreateDate"), datetime) else None,
+                                    "disabled": False, "expiresAt": None, "lastUsedAt": iso(key_used)})
             last_activity = max((item for item in activity if isinstance(item, datetime)), default=None)
+            if parsed_keys:
+                service_accounts.append({"id": arn, "email": username, "projectId": account_id, "displayName": username,
+                                         "description": "Usuário IAM com chave de acesso programático", "disabled": False,
+                                         "keys": parsed_keys, "createdBy": tags.get("created-by"), "createdAt": iso(user.get("CreateDate")) if isinstance(user.get("CreateDate"), datetime) else None,
+                                         "ownerHint": tags.get("owner")})
             identities.append({
                 "id": arn, "name": username, "type": "user", "enabled": True,
                 "mfaEnabled": mfa, "owner": tags.get("owner"), "lifecycleStatus": tags.get("lifecycle", "active"),
@@ -313,6 +326,18 @@ def discover_aws(credential: dict[str, Any], scopes: list[str] | None = None) ->
                 role_used = None
                 usage_reads["denied"] += 1
             role_used = role_used if isinstance(role_used, datetime) else None
+            document = role.get("AssumeRolePolicyDocument") or {}
+            statements = document.get("Statement", []) if isinstance(document, dict) else []
+            for statement in statements if isinstance(statements, list) else [statements]:
+                if not isinstance(statement, dict) or statement.get("Effect") != "Allow":
+                    continue
+                principals = statement.get("Principal") or {}
+                principals = {"AWS": principals} if isinstance(principals, str) else principals if isinstance(principals, dict) else {}
+                for kind, values in principals.items():
+                    for value in values if isinstance(values, list) else [values]:
+                        source = value if kind == "AWS" else f"{kind.lower()}:{value}"
+                        impersonation.append({"source": str(source), "target": arn, "role": "sts:AssumeRole",
+                                              "scope": "service_account", "resourceId": f"aws:account:{account_id}"})
             identities.append({
                 "id": arn, "name": role_name, "type": "service", "enabled": True, "mfaEnabled": None,
                 "owner": tags.get("owner"), "lifecycleStatus": tags.get("lifecycle", "active"),
@@ -330,7 +355,8 @@ def discover_aws(credential: dict[str, Any], scopes: list[str] | None = None) ->
     projects = restrict(projects, scopes, lambda item: item["id"], "AWS")
     usage_status = ("collected" if not usage_reads["denied"] else "partial" if usage_reads["ok"] else "permission_denied")
     return {"identities": identities, "accesses": accesses, "events": [], "projects": projects,
-            "principal": caller.get("Arn"), "expiresAt": aws_expiry(credential), "usageStatus": usage_status}
+            "principal": caller.get("Arn"), "expiresAt": aws_expiry(credential), "usageStatus": usage_status,
+            "serviceAccounts": service_accounts, "impersonation": impersonation, "nhiStatus": "collected"}
 
 
 def azure_parts(credential: dict[str, Any]) -> tuple[str, str, str]:
@@ -422,14 +448,18 @@ def discover_azure(credential: dict[str, Any], scopes: list[str] | None = None) 
             "principal": f"tenant {tenant}", "expiresAt": expires_at}
 
 
-def gcp_session(credential: dict[str, Any]):
+# IAM, Recommender and Policy Analyzer reject the read-only OAuth scope; the service account's IAM roles still keep every call read-only.
+GCP_FULL_SCOPE = ["https://www.googleapis.com/auth/cloud-platform"]
+
+
+def gcp_session(credential: dict[str, Any], oauth_scopes: list[str] | None = None):
     from google.auth.transport.requests import AuthorizedSession
     from google.oauth2 import service_account
 
     connector_options = {"organizationId", "projectQuery"}
     info = {key: value for key, value in credential.items() if key not in connector_options}
     info.setdefault("token_uri", GCP_TOKEN_URI)
-    oauth_scopes = ["https://www.googleapis.com/auth/cloud-platform.read-only"]
+    oauth_scopes = oauth_scopes or ["https://www.googleapis.com/auth/cloud-platform.read-only"]
     credentials = service_account.Credentials.from_service_account_info(info, scopes=oauth_scopes)
     return credentials, AuthorizedSession(credentials)
 
@@ -504,23 +534,41 @@ def probe_gcp(credential: dict[str, Any]) -> dict[str, Any]:
     )
     granted = set(response.json().get("permissions", [])) if response.ok else set()
     scopes = [scope_entry("GCP", item["projectId"], item.get("displayName")) for item in projects_raw]
-    return probe_result("GCP", str(credential.get("client_email", "")), scopes, granted, gcp_key_expiry(session, credential))
+    _, iam_session = gcp_session(credential, GCP_FULL_SCOPE)
+    return probe_result("GCP", str(credential.get("client_email", "")), scopes, granted, gcp_key_expiry(iam_session, credential))
 
 
 USAGE_HINT = {
-    "GCP": "Conceda roles/recommender.iamViewer e roles/policyanalyzer.activityAnalysisViewer à service account "
-           "e habilite as APIs Recommender e Policy Analyzer no projeto da credencial.",
+    "GCP": "Habilite as APIs Recommender e Policy Analyzer no projeto da credencial; a service account precisa de "
+           "roles/recommender.iamViewer e roles/policyanalyzer.activityAnalysisViewer se ainda não as tiver.",
     "AWS": "Conceda iam:GetAccessKeyLastUsed e iam:GetRole para ler o último uso de chaves e roles.",
     "Azure": "O conector Azure ainda não coleta telemetria de uso.",
 }
 
 
-def gcp_paginated(session: Any, url: str, key: str) -> tuple[list[dict[str, Any]], int]:
+def gcp_error(response: Any) -> str:
+    try:
+        error = response.json().get("error", {})
+    except Exception:
+        return f"HTTP {response.status_code}"
+    message = str(error.get("message", ""))
+    if "has not been used" in message or "is disabled" in message:
+        api = message.split(" API ")[0].strip() + " API" if " API " in message else "API"
+        project = message.split("in project ")[1].split(" ")[0] if "in project " in message else ""
+        return f"habilite a {api} no projeto {project}".strip()
+    if error.get("status") == "PERMISSION_DENIED":
+        return f"permissão negada ({message[:120]})"
+    return message[:160] or f"HTTP {response.status_code}"
+
+
+def gcp_paginated(session: Any, url: str, key: str, errors: list[str] | None = None) -> tuple[list[dict[str, Any]], int]:
     items: list[dict[str, Any]] = []
     token = None
     while True:
         response = session.get(url, params={"pageSize": 1000, **({"pageToken": token} if token else {})}, timeout=30)
         if not response.ok:
+            if errors is not None:
+                errors.append(gcp_error(response))
             return items, response.status_code
         payload = response.json()
         items.extend(payload.get(key, []))
@@ -534,26 +582,36 @@ def gcp_usage(credentials: Any, project_ids: list[str]) -> dict[str, Any]:
     observation) and Policy Analyzer service-account last authentication. Both are optional."""
     from google.auth.transport.requests import AuthorizedSession
 
+    errors: list[str] = []
+
     def read(project_id: str) -> tuple[str, list[dict[str, Any]], int, list[dict[str, Any]], int]:
         project_session = AuthorizedSession(credentials)
         try:
             insights, insight_status = gcp_paginated(
                 project_session,
                 f"https://recommender.googleapis.com/v1/projects/{project_id}/locations/global/insightTypes/google.iam.policy.Insight/insights",
-                "insights")
+                "insights", errors)
         except Exception:
             insights, insight_status = [], 599
         try:
             activities, activity_status = gcp_paginated(
                 project_session,
                 f"https://policyanalyzer.googleapis.com/v1/projects/{project_id}/locations/global/activityTypes/serviceAccountLastAuthentication/activities:query",
-                "activities")
+                "activities", errors)
         except Exception:
             activities, activity_status = [], 599
-        return project_id, insights, insight_status, activities, activity_status
+        try:
+            recommendations, _ = gcp_paginated(
+                project_session,
+                f"https://recommender.googleapis.com/v1/projects/{project_id}/locations/global/recommenders/google.iam.policy.Recommender/recommendations",
+                "recommendations")
+        except Exception:
+            recommendations = []
+        return project_id, insights, insight_status, activities, activity_status, recommendations
 
     bindings: dict[tuple[str, str, str], dict[str, Any]] = {}
     last_auth: dict[str, str] = {}
+    suggestions: list[dict[str, Any]] = []
     insight_ok = activity_ok = 0
     failures: set[int] = set()
     with ThreadPoolExecutor(max_workers=min(12, max(1, len(project_ids)))) as executor:
@@ -563,7 +621,8 @@ def gcp_usage(credentials: Any, project_ids: list[str]) -> dict[str, Any]:
                 results.append(future.result())
             except Exception:
                 failures.add(599)
-    for project_id, insights, insight_status, activities, activity_status in results:
+    for project_id, insights, insight_status, activities, activity_status, recommendations in results:
+        suggestions.extend(parse_gcp_recommendations(project_id, recommendations))
         if insight_status == 200:
             insight_ok += 1
         else:
@@ -590,7 +649,8 @@ def gcp_usage(credentials: Any, project_ids: list[str]) -> dict[str, Any]:
     status = ("collected" if insight_ok == len(project_ids) and activity_ok == len(project_ids)
               else "partial" if insight_ok or activity_ok
               else "permission_denied" if failures.intersection({401, 403}) else "unavailable")
-    return {"bindings": bindings, "lastAuth": last_auth, "status": status}
+    detail = "; ".join(sorted({error for error in errors})[:3])
+    return {"bindings": bindings, "lastAuth": last_auth, "status": status, "recommendations": suggestions, "detail": detail}
 
 
 def apply_gcp_usage(usage: dict[str, Any], identities: list[dict[str, Any]], accesses: list[dict[str, Any]],
@@ -618,6 +678,160 @@ def apply_gcp_usage(usage: dict[str, Any], identities: list[dict[str, Any]], acc
         moment = usage["lastAuth"].get(str(grant["identityId"]).partition(":")[2]) if str(grant["identityId"]).startswith("serviceAccount:") else None
         if moment:
             grant["lastUsedAt"] = moment
+
+
+GOOGLE_MANAGED_SA = ("@cloudservices.gserviceaccount.com", "-compute@developer.gserviceaccount.com", "@appspot.gserviceaccount.com",
+                     "@system.gserviceaccount.com", "@cloudbuild.gserviceaccount.com", "@gcp-sa-", "@container-engine-robot.",
+                     "@compute-system.", "@serverless-robot-prod.", "@gae-api-prod.", "@dataflow-service-producer-prod.")
+AI_SERVICE_AGENTS = (("gcp-sa-aiplatform-re", "Agente do Vertex AI Agent Engine"), ("gcp-sa-aiplatform-cc", "Agente de código do Vertex AI"),
+                     ("gcp-sa-aiplatform", "Agente de serviço do Vertex AI"), ("gcp-sa-discoveryengine", "Agente do Vertex AI Search / Agent Builder"),
+                     ("gcp-sa-dialogflow", "Agente do Dialogflow / Conversational Agents"), ("gcp-sa-cloudaicompanion", "Agente do Gemini para Google Cloud"),
+                     ("gcp-sa-notebooks", "Agente do Vertex AI Workbench"), ("gcp-sa-ml", "Agente do AI Platform"))
+AI_ROLE_PREFIXES = ("roles/aiplatform.", "roles/discoveryengine.", "roles/dialogflow.", "roles/cloudaicompanion.", "roles/ml.")
+IMPERSONATION_ROLES = {"roles/iam.serviceAccountTokenCreator": "emitir tokens como", "roles/iam.serviceAccountUser": "agir como",
+                       "roles/iam.workloadIdentityUser": "usar a identidade de workload de",
+                       "roles/iam.serviceAccountOpenIdTokenCreator": "emitir tokens OpenID como",
+                       "roles/owner": "administrar", "roles/editor": "agir como", "roles/iam.serviceAccountAdmin": "administrar"}
+
+
+def classify_gcp_member(member: str) -> tuple[str, str, str]:
+    """(member type, readable name, platform identity type) for a GCP IAM member."""
+    if member in {"allUsers", "allAuthenticatedUsers"}:
+        return member, member, "public"
+    member_type, _, member_name = member.partition(":")
+    if member_type == "deleted":
+        inner_type, _, inner_name = member_name.partition(":")
+        return "deleted", inner_name.split("?uid=")[0] or member_name, "deleted"
+    if member_type.startswith("principal"):
+        return member_type, member_name or member, "workload"
+    return member_type, member_name or member, {"serviceAccount": "service", "group": "group", "domain": "domain"}.get(member_type, "user")
+
+
+def ai_kind(email: str, roles: list[str] | None = None) -> str | None:
+    lowered = email.lower()
+    for marker, label in AI_SERVICE_AGENTS:
+        if marker in lowered:
+            return label
+    if roles and any(role.startswith(AI_ROLE_PREFIXES) for role in roles):
+        return "Conta com acesso a serviços de IA"
+    return None
+
+
+def parse_gcp_recommendations(project_id: str, recommendations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """IAM Recommender: role removals and replacements per member, with the suggested predefined roles."""
+    result = []
+    for recommendation in recommendations:
+        if (recommendation.get("stateInfo") or {}).get("state", "ACTIVE") != "ACTIVE":
+            continue
+        removes, adds = [], []
+        for group in (recommendation.get("content") or {}).get("operationGroups", []):
+            for operation in group.get("operations", []):
+                filters = operation.get("pathFilters") or {}
+                role = filters.get("/iamPolicy/bindings/*/role")
+                member = filters.get("/iamPolicy/bindings/*/members/*") or operation.get("value")
+                if not role or not member:
+                    continue
+                (removes if operation.get("action") == "remove" else adds if operation.get("action") == "add" else []).append((member, role))
+        for member, role in removes:
+            suggested = sorted({added_role for added_member, added_role in adds if added_member == member})
+            result.append({"projectId": project_id, "member": member, "role": role, "action": "replace" if suggested else "remove",
+                           "suggestedRoles": suggested, "description": recommendation.get("description", ""),
+                           "subtype": recommendation.get("recommenderSubtype", "")})
+    return result
+
+
+def gcp_nhi(credentials: Any, project_ids: list[str]) -> dict[str, Any]:
+    """Service accounts, user-managed keys, who can impersonate each account and who created it (400-day audit logs)."""
+    from google.auth.transport.requests import AuthorizedSession
+
+    since = (datetime.now(timezone.utc) - timedelta(days=400)).isoformat().replace("+00:00", "Z")
+
+    def per_project(project_id: str) -> tuple[str, list[dict[str, Any]], int, dict[str, dict[str, str]], dict[str, str]]:
+        project_session = AuthorizedSession(credentials)
+        accounts, status = gcp_paginated(project_session, f"https://iam.googleapis.com/v1/projects/{project_id}/serviceAccounts", "accounts")
+        created: dict[str, dict[str, str]] = {}
+        key_auth: dict[str, str] = {}
+        try:
+            response = project_session.post("https://logging.googleapis.com/v2/entries:list", json={
+                "resourceNames": [f"projects/{project_id}"], "pageSize": 1000, "orderBy": "timestamp desc",
+                "filter": f'protoPayload.methodName="google.iam.admin.v1.CreateServiceAccount" AND timestamp>="{since}"'}, timeout=30)
+            for entry in response.json().get("entries", []) if response.ok else []:
+                payload = entry.get("protoPayload") or {}
+                email = (payload.get("response") or {}).get("email")
+                account_id = (payload.get("request") or {}).get("account_id")
+                email = email or (f"{account_id}@{project_id}.iam.gserviceaccount.com" if account_id else None)
+                creator = (payload.get("authenticationInfo") or {}).get("principalEmail")
+                if email and creator:
+                    created[email] = {"by": creator, "at": entry.get("timestamp", "")}
+        except Exception:
+            pass
+        try:
+            activities, _ = gcp_paginated(project_session,
+                f"https://policyanalyzer.googleapis.com/v1/projects/{project_id}/locations/global/activityTypes/serviceAccountKeyLastAuthentication/activities:query",
+                "activities")
+            for item in activities:
+                activity = item.get("activity") or {}
+                key_name = (activity.get("serviceAccountKey") or {}).get("fullResourceName", "")
+                moment = activity.get("lastAuthenticatedTime")
+                if key_name and moment:
+                    key_auth[key_name.rsplit("/keys/", 1)[-1]] = moment
+        except Exception:
+            pass
+        return project_id, accounts, status, created, key_auth
+
+    def per_account(account: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+        account_session = AuthorizedSession(credentials)
+        email = account["email"]
+        keys_response = account_session.get(f"https://iam.googleapis.com/v1/projects/-/serviceAccounts/{email}/keys",
+                                            params={"keyTypes": "USER_MANAGED"}, timeout=20)
+        keys = keys_response.json().get("keys", []) if keys_response.ok else []
+        policy_response = account_session.post(f"https://iam.googleapis.com/v1/projects/-/serviceAccounts/{email}:getIamPolicy", json={}, timeout=20)
+        bindings = policy_response.json().get("bindings", []) if policy_response.ok else []
+        return account, keys, bindings
+
+    with ThreadPoolExecutor(max_workers=min(16, max(1, len(project_ids)))) as executor:
+        project_results = []
+        for future in as_completed([executor.submit(per_project, project_id) for project_id in project_ids]):
+            try:
+                project_results.append(future.result())
+            except Exception:
+                continue
+    accounts = [(project_id, account) for project_id, items, _, _, _ in project_results for account in items]
+    created = {email: info for _, _, _, items, _ in project_results for email, info in items.items()}
+    key_auth = {key: moment for _, _, _, _, items in project_results for key, moment in items.items()}
+    listed_ok = sum(1 for _, _, status, _, _ in project_results if status == 200)
+    service_accounts, impersonation = [], []
+    with ThreadPoolExecutor(max_workers=24) as executor:
+        futures = {executor.submit(per_account, account): project_id for project_id, account in accounts}
+        for future in as_completed(futures):
+            try:
+                account, keys, bindings = future.result()
+            except Exception:
+                continue
+            email = account["email"]
+            parsed_keys = []
+            for key in keys:
+                key_id = key.get("name", "").rsplit("/keys/", 1)[-1]
+                expires = parse_iso(key.get("validBeforeTime"))
+                parsed_keys.append({"id": key_id, "createdAt": key.get("validAfterTime"), "disabled": bool(key.get("disabled")),
+                                    "expiresAt": expires.isoformat() if expires and expires.year < 9999 else None,
+                                    "lastUsedAt": key_auth.get(key_id)})
+            for binding in bindings:
+                role = binding.get("role", "")
+                if role in IMPERSONATION_ROLES:
+                    for member in binding.get("members", []):
+                        impersonation.append({"source": member, "target": f"serviceAccount:{email}", "role": role,
+                                              "scope": "service_account", "resourceId": futures[future]})
+            description = account.get("description") or ""
+            owner_hint = next((token for token in description.replace(",", " ").split() if "@" in token and "." in token), None)
+            creation = created.get(email)
+            service_accounts.append({
+                "id": f"serviceAccount:{email}", "email": email, "projectId": futures[future], "displayName": account.get("displayName") or "",
+                "description": description, "disabled": bool(account.get("disabled")), "keys": parsed_keys,
+                "createdBy": creation["by"] if creation else None, "createdAt": creation["at"] if creation else None,
+                "ownerHint": owner_hint})
+    status = "collected" if project_ids and listed_ok == len(project_ids) else "partial" if listed_ok else "unavailable"
+    return {"serviceAccounts": service_accounts, "impersonation": impersonation, "status": status}
 
 
 def discover_gcp(credential: dict[str, Any], scopes: list[str] | None = None) -> dict[str, list[dict[str, Any]]]:
@@ -676,8 +890,7 @@ def discover_gcp(credential: dict[str, Any], scopes: list[str] | None = None) ->
         for binding in policy_response.json().get("bindings", []):
             role = binding["role"]
             for member in binding.get("members", []):
-                member_type, _, member_name = member.partition(":")
-                identity_type = "public" if member in {"allUsers", "allAuthenticatedUsers"} else "service" if member_type == "serviceAccount" else "group" if member_type == "group" else "user"
+                member_type, member_name, identity_type = classify_gcp_member(member)
                 identities_by_id.setdefault(member, {
                     "id": member, "name": member_name or member, "email": member_name if "@" in member_name else None,
                     "type": identity_type, "enabled": True, "mfaEnabled": None, "owner": None, "lifecycleStatus": "active",
@@ -762,13 +975,19 @@ def discover_gcp(credential: dict[str, Any], scopes: list[str] | None = None) ->
         telemetry_status = "permission_denied" if telemetry_http_statuses.intersection({401, 403}) else "unavailable"
     elif telemetry_http_statuses:
         telemetry_status = "partial"
+    iam_credentials, iam_session = gcp_session(credential, GCP_FULL_SCOPE)
     try:
-        usage = gcp_usage(credentials, project_ids)
+        usage = gcp_usage(iam_credentials, project_ids)
     except Exception:
-        usage = {"bindings": {}, "lastAuth": {}, "status": "unavailable"}
+        usage = {"bindings": {}, "lastAuth": {}, "status": "unavailable", "recommendations": [], "detail": ""}
     identities = list(identities_by_id.values())
     apply_gcp_usage(usage, identities, accesses, events)
+    try:
+        nhi = gcp_nhi(iam_credentials, project_ids)
+    except Exception:
+        nhi = {"serviceAccounts": [], "impersonation": [], "status": "unavailable"}
     return {"identities": identities, "accesses": accesses, "events": events, "projects": projects,
-            "usageStatus": usage["status"],
+            "usageStatus": usage["status"], "usageDetail": usage.get("detail", ""), "recommendations": usage["recommendations"],
+            "serviceAccounts": nhi["serviceAccounts"], "impersonation": nhi["impersonation"], "nhiStatus": nhi["status"],
             "telemetryStatus": telemetry_status, "telemetryHttpStatuses": sorted(telemetry_http_statuses),
-            "principal": credential.get("client_email"), "expiresAt": gcp_key_expiry(session, credential)}
+            "principal": credential.get("client_email"), "expiresAt": gcp_key_expiry(iam_session, credential)}

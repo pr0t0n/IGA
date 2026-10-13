@@ -17,6 +17,9 @@ const state = {
   acc: { view: 'grants', prov: 'all', unused: false, q: '', grants: [], summary: null, projects: null, roles: null, accounts: null },
   risk: { rule: 'all', severity: null, findings: [], rules: [], ai: [] },
   priv: { rows: [], summary: null, standing: false, role: null },
+  nhi: { list: [], summary: null, filter: 'all', q: '', selected: null },
+  lp: { list: [], summary: null, status: 'open', action: 'all', q: '', selected: null },
+  graph: { summary: null, paths: [], external: false },
   ueba: { data: null, category: null, selected: null, generating: null, attempted: new Set() },
   audit: { data: null, source: null, result: 'all', q: '', selected: null },
   comp: { fw: 'iso', frameworks: [], campaigns: [] },
@@ -28,9 +31,12 @@ const NAV = [
   ['dashboard', 'Visão geral', 'M3 3h7v9H3z M14 3h7v5h-7z M14 12h7v9h-7z M3 16h7v5H3z'],
   ['h', 'Governança'],
   ['identidades', 'Identidades', 'M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2 M9 3a4 4 0 1 0 0 8a4 4 0 1 0 0-8 M22 21v-2a4 4 0 0 0-3-3.87 M16 3.13a4 4 0 0 1 0 7.75'],
+  ['nhi', 'Identidades não humanas', 'M12 8V4H8 M4 8h16v12H4z M2 14h2 M20 14h2 M15 13v2 M9 13v2'],
   ['acessos', 'Inventário de acessos', 'M8 3L4 7l4 4 M4 7h16 M16 21l4-4-4-4 M20 17H4'],
+  ['menorprivilegio', 'Menor privilégio', 'M15 15l6 6 M15 15v4.8 M15 15h4.8 M9 19.8V15 M9 15H4.2 M9 15l-6 6 M15 4.2V9 M15 9h4.8 M15 9l6-6 M9 4.2V9 M9 9H4.2 M9 9L3 3'],
   ['riscos', 'Inteligência e riscos', 'M12 2L2 7l10 5 10-5-10-5Z M2 17l10 5 10-5 M2 12l10 5 10-5'],
   ['privilegiados', 'Acesso privilegiado', 'M2 15.5a5.5 5.5 0 1 0 11 0a5.5 5.5 0 1 0-11 0 M21 2l-9.6 9.6 M15.5 7.5l3 3L22 7l-3-3'],
+  ['caminhos', 'Caminhos de acesso', 'M12 15a3 3 0 1 0 0 6a3 3 0 1 0 0-6 M6 3a3 3 0 1 0 0 6a3 3 0 1 0 0-6 M18 3a3 3 0 1 0 0 6a3 3 0 1 0 0-6 M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9 M12 12v3'],
   ['ueba', 'UEBA', 'M22 12h-4l-3 9L9 3l-3 9H2'],
   ['h', 'Plataforma'],
   ['credenciais', 'Credenciais', 'M12 22v-5 M9 8V2 M15 8V2 M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z'],
@@ -41,7 +47,10 @@ const NAV = [
 const PAGES = {
   dashboard: { crumb: ['Visão geral', 'Postura de acesso'], search: true, bell: true, add: true, load: () => loadDashboard() },
   identidades: { crumb: ['Governança', 'Identidades'], add: true, load: () => loadIdentities() },
+  nhi: { crumb: ['Governança', 'Identidades não humanas'], add: true, load: () => loadNhi() },
   acessos: { crumb: ['Governança', 'Inventário de acessos'], add: true, load: () => loadAccesses() },
+  menorprivilegio: { crumb: ['Governança', 'Menor privilégio'], add: true, load: () => loadLeastPrivilege() },
+  caminhos: { crumb: ['Governança', 'Caminhos de acesso'], add: true, load: () => loadGraph() },
   riscos: { crumb: ['Governança', 'Inteligência e riscos'], add: true, load: () => loadRisks() },
   privilegiados: { crumb: ['Governança', 'Acesso privilegiado'], add: true, load: () => loadPrivileged() },
   ueba: { crumb: ['Governança', 'UEBA'], add: true, load: () => loadUeba() },
@@ -52,7 +61,7 @@ const PAGES = {
 };
 const LEVEL = { critical: 'Crítico', high: 'Alto', medium: 'Médio', low: 'Baixo' };
 const ROLE_LABEL = { admin: 'Administrador', analyst: 'Analista', auditor: 'Auditor', reader: 'Leitor' };
-const TYPE_LABEL = { user: 'Humana', service: 'Serviço', group: 'Grupo', public: 'Público' };
+const TYPE_LABEL = { user: 'Humana', service: 'Serviço', group: 'Grupo', public: 'Público', deleted: 'Excluída', domain: 'Domínio', workload: 'Workload federada' };
 const RESOURCE_LABEL = { project: 'Projeto', account: 'Conta', subscription: 'Assinatura', repository: 'Repositório', resource: 'Recurso' };
 const SCOPE_KIND = { GCP: 'Projeto', AWS: 'Conta', Azure: 'Assinatura' };
 const STATUS_LABEL = { open: 'Aberto', remediating: 'Em remediação', accepted: 'Risco aceito', incident: 'Incidente aberto', dismissed: 'Descartado' };
@@ -375,7 +384,12 @@ async function selectIdentity(id) {
       <div class="big-score"><b>${d.riskScore}</b><span>nota de risco · ${LEVEL[levelOf(d.riskScore)].toLowerCase()}</span></div>
       <div class="kv"><span>Ambiente</span><span>${escapeHtml(d.environment)} · ${escapeHtml(d.provider)}</span><span>Responsável</span><span>${escapeHtml(d.owner || 'Não informado pelo provedor')}</span><span>Ciclo de vida</span><span>${lifecycle}</span><span>MFA</span><span>${mfa}</span><span>Acessos</span><span>${fmt(d.accesses.length)} concessões · ${fmt(d.privilegedCount)} privilegiadas</span><span>Último login</span><span>${d.lastSeenAt ? formatDate(d.lastSeenAt) : 'Não informado'}</span></div>
       <div class="stack-6"><div class="overline">Sinais de risco</div>${d.findings.map(f => `<div class="flag" title="${escapeHtml(f.description)}">${escapeHtml(f.title)}</div>`).join('') || '<div class="muted">Nenhum sinal de risco ativo.</div>'}</div>
+      <div class="stack-6" id="id-reach"></div>
       <div class="stack-6 push-bottom"><button type="button" class="btn btn-primary btn-block" data-identity-accesses="${escapeHtml(d.externalId)}">Ver acessos desta identidade</button><button type="button" class="btn btn-secondary btn-block mutating" data-new-review="identity" data-identity-id="${d.id}" data-identity-name="${escapeHtml(d.name)}">Solicitar revisão ao responsável</button></div>`);
+    api(`/graph/identity?credential_id=${d.credentialId}&identity=${encodeURIComponent(d.externalId)}`).then(r => {
+      if (state.ids.selected !== id || !$('#id-reach')) return;
+      setHTML('#id-reach', `<div class="overline">Raio de impacto</div><div class="kv"><span>Acesso direto</span><span>${fmt(r.directResources)} recurso(s) · ${fmt(r.privilegedDirect)} privilegiado(s)</span><span>Via personificação</span><span class="${r.privilegedIndirect ? 'accent-text semibold' : ''}">+${fmt(r.indirectResources)} recurso(s) · ${fmt(r.privilegedIndirect)} privilegiado(s)</span><span>Pode personificar</span><span>${fmt(r.canImpersonate.length)} conta(s)</span><span>Personificável por</span><span>${fmt(r.impersonatedBy.length)} identidade(s)</span></div>${r.canImpersonate.length || r.impersonatedBy.length ? `<button type="button" class="btn btn-ghost btn-xs" data-reach="${escapeHtml(d.externalId)}" data-credential="${d.credentialId}" data-name="${escapeHtml(d.name)}">Ver raio de impacto →</button>` : ''}`);
+    }).catch(() => {});
   } catch (error) { setHTML(aside, `<div class="alert">${escapeHtml(error.message)}</div>`); }
 }
 
@@ -463,6 +477,162 @@ async function openProject(credentialId, resourceId) {
   } catch (error) { setHTML(content, `<div class="alert">${escapeHtml(error.message)}</div>`); }
 }
 function openIdentityPage(id) { navigate('identidades', { apply: () => { state.ids.selected = id; } }); }
+
+/* ══ Identidades não humanas ═════════════════════════════════════════ */
+async function loadNhi() {
+  try {
+    const [list, summary] = await Promise.all([api('/nhi'), api('/nhi/summary')]);
+    Object.assign(state.nhi, { list, summary }); renderNhi();
+    const selected = state.nhi.selected && list.find(item => item.id === state.nhi.selected.id && item.credentialId === state.nhi.selected.credentialId);
+    if (selected) selectNhi(selected); else { state.nhi.selected = null; $('#nhi-aside').hidden = true; }
+  } catch (error) { toast(`Identidades não humanas indisponíveis: ${error.message}`); }
+}
+function filteredNhi() {
+  const n = state.nhi; const query = n.q.trim().toLowerCase(); const limit = n.summary?.keyAgeDays || 90;
+  const test = { all: () => true, keys: i => i.activeKeys > 0, oldkeys: i => i.oldestKeyDays !== null && i.oldestKeyDays > limit,
+    noowner: i => !i.owner && i.kind !== 'Gerenciada pelo Google', impersonable: i => i.impersonators > 0, ai: i => i.aiKind, privileged: i => i.privilegedCount > 0 }[n.filter];
+  return n.list.filter(item => test(item) && (!query || `${item.name} ${item.displayName} ${item.project || ''} ${item.owner || ''} ${item.environment}`.toLowerCase().includes(query)));
+}
+function renderNhi() {
+  const n = state.nhi; const s = n.summary; const rows = filteredNhi();
+  setHTML('#nhi-kpis', [
+    stat('Identidades não humanas', fmt(s.total), `${fmt(s.userManaged)} do cliente · ${fmt(s.googleManaged)} gerenciadas pelo provedor`),
+    stat('Com chaves ativas', fmt(s.withKeys), `${fmt(s.activeKeys)} chave(s) de longa duração`),
+    stat(`Chaves > ${s.keyAgeDays} dias`, fmt(s.oldKeys), 'contas com chave antiga', true),
+    stat('Sem responsável', fmt(s.noOwner), 'contas do cliente sem dono comprovado', true),
+    stat('Personificáveis', fmt(s.impersonable), 'outras identidades podem agir como elas'),
+    stat('Agentes e serviços de IA', fmt(s.ai), 'Vertex AI, Gemini, Bedrock e afins'),
+  ].join(''));
+  $('#nhi-count').textContent = `${fmt(rows.length)} de ${fmt(s.total)}`;
+  const shown = pageOf('nhi', rows, `${n.filter}|${n.q}`);
+  const hasProject = n.list.some(i => i.project); const hasUse = n.list.some(i => i.lastUsedAt);
+  setHTML('#nhi-table', tableHTML('', [
+    { head: 'Identidade', cell: i => `<td><div class="semibold break">${escapeHtml(i.name)}</div><div class="t-sub">${escapeHtml(i.aiKind || i.kind)}${i.disabled ? ' · desativada' : ''}</div></td>` },
+    { head: 'Projeto', show: hasProject, cell: i => `<td class="break">${escapeHtml(i.project || '—')}</td>` },
+    { head: 'Responsável', cell: i => `<td class="break">${i.owner ? `<div>${escapeHtml(i.owner)}</div><div class="t-sub">${escapeHtml(i.ownerSource)}</div>` : '<span class="accent-text semibold">Não identificado</span>'}</td>` },
+    { head: 'Chaves', cell: i => `<td class="nowrap">${i.activeKeys ? `<b>${i.activeKeys}</b><div class="t-sub ${i.oldestKeyDays > s.keyAgeDays ? 'accent-text' : ''}">mais antiga: ${fmt(i.oldestKeyDays)} d</div>` : '<span class="muted">—</span>'}</td>` },
+    { head: 'Último uso', show: hasUse, cell: i => `<td class="muted nowrap">${i.lastUsedAt ? ago(i.lastUsedAt) : '—'}</td>` },
+    { head: 'Privilégios', right: true, cell: i => `<td class="right num">${i.privilegedCount ? `<b class="accent-text">${fmt(i.privilegedCount)}</b>` : '0'} <span class="muted">/ ${fmt(i.grantCount)}</span></td>` },
+    { head: 'Personificável por', right: true, cell: i => `<td class="right num">${i.impersonators ? `<b>${fmt(i.impersonators)}</b>` : '<span class="muted">0</span>'}</td>` },
+    { head: 'Sinais', cell: i => `<td>${i.flags.length ? `<span class="flag-inline">${escapeHtml(i.flags[0])}</span>${i.flags.length > 1 ? ` <span class="muted-sm">+${i.flags.length - 1}</span>` : ''}` : '<span class="muted">—</span>'}</td>` },
+  ], shown, i => ` class="clickable${n.selected && n.selected.id === i.id && n.selected.credentialId === i.credentialId ? ' selected' : ''}" data-nhi="${escapeHtml(i.id)}" data-credential="${i.credentialId}"`,
+  n.list.length ? 'Nenhuma identidade corresponde ao filtro.' : 'Execute uma análise para preencher o inventário.'));
+  setHTML('#nhi-foot', pagerHTML('nhi', rows.length));
+}
+async function selectNhi(item) {
+  state.nhi.selected = { id: item.id, credentialId: item.credentialId };
+  $$('#nhi-table tr[data-nhi]').forEach(row => row.classList.toggle('selected', row.dataset.nhi === item.id && Number(row.dataset.credential) === item.credentialId));
+  const aside = $('#nhi-aside'); aside.hidden = false; setHTML(aside, '<div class="muted">Carregando conta…</div>');
+  try {
+    const d = await api(`/nhi/detail?credential_id=${item.credentialId}&identity=${encodeURIComponent(item.id)}`);
+    if (state.nhi.selected?.id !== item.id) return;
+    const keyAge = state.nhi.summary.keyAgeDays;
+    setHTML(aside, `
+      <div class="dialog-head"><div class="break"><div class="card-kicker">${escapeHtml(d.aiKind || d.kind)}</div><div class="aside-title sm">${escapeHtml(d.name)}</div><div class="muted-sm">${escapeHtml(d.environment)}${d.project ? ` · projeto ${escapeHtml(d.project)}` : ''}</div></div><button type="button" class="btn btn-icon" aria-label="Fechar" data-close-nhi>${ICON.close}</button></div>
+      <div class="kv"><span>Responsável</span><span>${d.owner ? `${escapeHtml(d.owner)}<br><span class="muted-sm">${escapeHtml(d.ownerSource)}</span>` : '<b class="accent-text">Não identificado</b>'}</span>${d.createdBy ? `<span>Criada por</span><span>${escapeHtml(d.createdBy)}${d.createdAt ? ` · ${formatDate(d.createdAt)}` : ''}</span>` : ''}<span>Último uso</span><span>${d.lastUsedAt ? formatDate(d.lastUsedAt) : 'Não informado pelo provedor'}</span><span>Privilégios</span><span>${fmt(d.privilegedCount)} privilegiada(s) de ${fmt(d.grantCount)} concessão(ões)</span></div>
+      ${d.flags.length ? `<div class="stack-6"><div class="overline">Sinais</div>${d.flags.map(flag => `<div class="flag">${escapeHtml(flag)}</div>`).join('')}</div>` : ''}
+      <div class="stack-6"><div class="overline">Chaves de longa duração (${d.keys.length})</div>${d.keys.map(key => { const age = key.createdAt ? Math.floor((Date.now() - new Date(key.createdAt)) / 86400000) : null; return `<div class="key-row"><span class="mono break">${escapeHtml(key.id.slice(0, 12))}…</span><span class="${age > keyAge ? 'accent-text semibold' : ''}">${age === null ? '—' : `${fmt(age)} dias`}</span><span class="muted-sm">${key.disabled ? 'desativada' : key.lastUsedAt ? `uso ${ago(key.lastUsedAt)}` : 'uso não informado'}</span></div>`; }).join('') || '<div class="muted">Nenhuma chave gerenciada pelo usuário.</div>'}</div>
+      <div class="stack-6"><div class="overline">Quem pode personificá-la (${d.impersonatedBy.length})</div>${d.impersonatedBy.map(edge => `<div class="key-row"><span class="break">${escapeHtml(edge.name)}</span><span class="mono muted-sm">${escapeHtml(edge.role)}</span><span class="muted-sm">${edge.scope === 'project' ? 'no projeto' : 'na conta'}</span></div>`).join('') || '<div class="muted">Ninguém além dela mesma.</div>'}</div>
+      <div class="stack-6"><div class="overline">Concessões (${d.grants.length})</div>${d.grants.slice(0, 12).map(grant => `<div class="key-row"><span class="break">${escapeHtml(grant.resource)}</span><span class="mono muted-sm break">${escapeHtml(grant.role)}</span>${grant.privileged ? '<span class="tag tag-accent">Privilegiado</span>' : '<span></span>'}</div>`).join('') || '<div class="muted">Sem concessões coletadas.</div>'}${d.grants.length > 12 ? `<div class="muted-sm">e mais ${d.grants.length - 12}</div>` : ''}</div>
+      <div class="stack-6 push-bottom"><button type="button" class="btn btn-primary btn-block" data-reach="${escapeHtml(d.id)}" data-credential="${d.credentialId}" data-name="${escapeHtml(d.name)}">Ver raio de impacto</button></div>`);
+  } catch (error) { setHTML(aside, `<div class="alert">${escapeHtml(error.message)}</div>`); }
+}
+
+/* ══ Menor privilégio ════════════════════════════════════════════════ */
+async function loadLeastPrivilege() {
+  try {
+    const [list, summary] = await Promise.all([api(`/recommendations?status=${state.lp.status}`), api('/recommendations/summary')]);
+    Object.assign(state.lp, { list, summary });
+    if (state.lp.selected && !list.some(item => item.id === state.lp.selected)) state.lp.selected = null;
+    renderLeastPrivilege();
+  } catch (error) { toast(`Recomendações indisponíveis: ${error.message}`); }
+}
+function filteredRecommendations() {
+  const l = state.lp; const query = l.q.trim().toLowerCase();
+  return l.list.filter(item => (l.action === 'all' || item.action === l.action) && (!query || `${item.identityName} ${item.identityId} ${item.resourceName} ${item.role}`.toLowerCase().includes(query)));
+}
+function renderLeastPrivilege() {
+  const l = state.lp; const s = l.summary; const rows = filteredRecommendations();
+  setHTML('#lp-kpis', [
+    stat('Recomendações abertas', fmt(s.open), `${fmt(s.byAction.remove)} remover · ${fmt(s.byAction.replace)} substituir · ${fmt(s.byAction.move_to_group)} mover`),
+    stat('Privilegiadas a reduzir', fmt(s.privilegedOpen), `${pct(s.privilegedOpen, s.privilegedTotal)}% das ${fmt(s.privilegedTotal)} concessões privilegiadas`, true),
+    stat('Papéis básicos', fmt(s.basicRoles), 'owner, editor e viewer a revisar'),
+    stat('Do IAM Recommender', s.recommenderAvailable ? fmt(s.fromProvider) : '—', s.recommenderAvailable ? 'baseadas no uso de 90 dias' : 'sem acesso ao Recommender'),
+    stat('Implementadas', fmt(s.implemented), 'comprovadas na análise seguinte'),
+    stat('Descartadas', fmt(s.dismissed), 'com justificativa auditada'),
+  ].join(''));
+  $('#lp-count').textContent = `${fmt(rows.length)} recomendação(ões)`;
+  const shown = pageOf('lp', rows, `${l.status}|${l.action}|${l.q}`);
+  setHTML('#lp-table', tableHTML('', [
+    { head: 'Severidade', cell: r => `<td>${sevTag(r.severity)}</td>` },
+    { head: 'Identidade', cell: r => `<td><div class="semibold break">${escapeHtml(r.identityName)}</div><div class="t-sub">${escapeHtml(TYPE_LABEL[r.identityType] || r.identityType || '')} · ${escapeHtml(r.provider)}</div></td>` },
+    { head: 'Recurso', cell: r => `<td class="break">${escapeHtml(r.resourceName)}</td>` },
+    { head: 'Papel atual', cell: r => `<td class="mono break">${escapeHtml(r.role)}</td>` },
+    { head: 'Recomendação', cell: r => `<td><span class="tag ${r.action === 'remove' ? 'tag-accent' : 'tag-outline'}">${escapeHtml(r.actionLabel)}</span>${r.suggestedRoles.length ? `<div class="t-sub mono break">→ ${r.suggestedRoles.map(escapeHtml).join(', ')}</div>` : ''}</td>` },
+    { head: 'Fonte', cell: r => `<td class="muted-sm">${escapeHtml(r.source)}</td>` },
+    { head: l.status === 'resolved' ? 'Implementada' : 'Desde', cell: r => `<td class="muted nowrap">${formatDate(l.status === 'resolved' ? r.resolvedAt : r.firstSeenAt)}</td>` },
+  ], shown, r => ` class="clickable${l.selected === r.id ? ' selected' : ''}" data-rec="${r.id}"`,
+  l.status === 'open' ? (l.list.length ? 'Nenhuma recomendação para este filtro.' : 'Nenhuma recomendação aberta. Execute uma análise para avaliar os acessos.') : 'Nada nesta situação ainda.'));
+  setHTML('#lp-foot', pagerHTML('lp', rows.length));
+  const selected = l.list.find(item => item.id === l.selected); const aside = $('#lp-aside'); aside.hidden = !selected;
+  if (selected) {
+    setHTML(aside, `<div class="dialog-head"><div class="break"><div class="card-kicker">${escapeHtml(selected.actionLabel)} · ${escapeHtml(selected.source)}</div><div class="aside-title sm">${escapeHtml(selected.role)}</div><div class="muted-sm break">${escapeHtml(selected.identityName)} · ${escapeHtml(selected.resourceName)}</div></div><button type="button" class="btn btn-icon" aria-label="Fechar" data-close-lp>${ICON.close}</button></div>
+      <div class="explain-block"><span class="overline">Por quê</span><p>${escapeHtml(selected.reason)}</p></div>
+      ${selected.suggestedRoles.length ? `<div class="explain-block"><span class="overline">Papéis sugeridos</span><p class="mono">${selected.suggestedRoles.map(escapeHtml).join('<br>')}</p></div>` : ''}
+      <div class="explain-block"><span class="overline">Comando para o responsável aplicar</span><pre class="json">${escapeHtml(selected.command)}</pre></div>
+      <div class="note">A plataforma não aplica a mudança. Depois de aplicada no provedor, a próxima análise marca a recomendação como implementada.</div>
+      ${selected.statusNote ? `<div class="explain-block"><span class="overline">Justificativa</span><p>${escapeHtml(selected.statusNote)}</p></div>` : ''}
+      <div class="stack-6 push-bottom"><button type="button" class="btn btn-secondary btn-block" data-copy-command="${selected.id}">Copiar comando</button>${isReadonly() || selected.status === 'resolved' ? '' : selected.status === 'dismissed' ? `<button type="button" class="btn btn-ghost btn-block" data-rec-status="open" data-id="${selected.id}">Reabrir recomendação</button>` : `<button type="button" class="btn btn-ghost btn-block" data-rec-status="dismissed" data-id="${selected.id}">Descartar com justificativa</button>`}</div>`);
+  }
+}
+function exportRecommendationsScript() {
+  const rows = filteredRecommendations().filter(item => item.status === 'open');
+  if (!rows.length) { toast('Nenhuma recomendação aberta para exportar.'); return; }
+  const lines = ['#!/usr/bin/env bash', `# Nexo IGA · recomendações de menor privilégio · ${new Date().toISOString()}`, '# Revise cada bloco antes de executar. Os comandos alteram o IAM do provedor.', 'set -euo pipefail', ''];
+  rows.forEach(item => { lines.push(`# [${item.severity}] ${item.actionLabel}: ${item.identityName} · ${item.role} em ${item.resourceName}`, `# ${item.reason.replace(/\n/g, ' ')}`, item.command, ''); });
+  const link = document.createElement('a'); link.href = URL.createObjectURL(new Blob([lines.join('\n')], { type: 'text/x-shellscript' }));
+  link.download = `menor-privilegio-${new Date().toISOString().slice(0, 10)}.sh`; link.click(); URL.revokeObjectURL(link.href);
+  toast(`${rows.length} comando(s) exportado(s) para revisão.`);
+}
+
+/* ══ Caminhos de acesso ══════════════════════════════════════════════ */
+async function loadGraph() {
+  try {
+    const [summary, paths] = await Promise.all([api('/graph/summary'), api('/graph/paths?limit=5000')]);
+    Object.assign(state.graph, { summary, paths }); renderGraph();
+  } catch (error) { toast(`Caminhos de acesso indisponíveis: ${error.message}`); }
+}
+function renderGraph() {
+  const s = state.graph.summary;
+  setHTML('#graph-kpis', [
+    stat('Caminhos até privilégio', fmt(s.paths), 'privilégios obtidos indiretamente'),
+    stat('Críticos', fmt(s.critical), 'chegam a papéis administrativos', true),
+    stat('Origem externa', fmt(s.external), 'contas fora dos domínios corporativos', true),
+    stat('Identidades com caminho', fmt(s.identitiesWithPaths), 'origens de escalada'),
+    stat('Relações de personificação', fmt(s.edges), `${fmt(s.sources)} identidades → ${fmt(s.targets)} contas`),
+    stat('Domínios corporativos', fmt(s.domains.length), s.domains.length ? escapeHtml(s.domains.slice(0, 3).join(', ')) + (s.domains.length > 3 ? '…' : '') : 'não identificados'),
+  ].join(''));
+  const maxBlast = Math.max(1, ...s.topBlast.map(item => item.privilegedIndirect || item.indirectResources));
+  setHTML('#graph-blast', `<div><div class="card-kicker">Raio de impacto</div><div class="card-title">Maior alcance indireto</div></div>${s.topBlast.map(item => `<button type="button" class="rule-row" data-reach="${escapeHtml(item.identity)}" data-credential="${item.credentialId}" data-name="${escapeHtml(item.name)}"><span class="rule-name" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</span><span class="rule-n">${fmt(item.privilegedIndirect)}</span>${bar((item.privilegedIndirect || item.indirectResources) / maxBlast * 100, 'var(--color-accent)', 'bar-4 full')}<span class="muted-sm full-row">+${fmt(item.indirectResources)} recurso(s) e ${fmt(item.privilegedIndirect)} privilégio(s) via ${fmt(item.accounts)} conta(s)</span></button>`).join('') || '<div class="empty">Nenhuma identidade alcança recursos indiretamente.</div>'}`);
+  renderGraphPaths();
+}
+function renderGraphPaths() {
+  const g = state.graph; const rows = g.paths.filter(path => !g.external || path.external);
+  const shown = pageOf('graph', rows, String(g.external));
+  setHTML('#graph-paths', shown.map(path => `<button type="button" class="path-row" data-reach="${escapeHtml(path.source)}" data-credential="${path.credentialId}" data-name="${escapeHtml(path.sourceName)}">${sevTag(path.severity)}<span class="chain"><b class="break">${escapeHtml(path.sourceName)}</b>${path.external ? '<span class="tag tag-accent">externa</span>' : ''}${path.steps.map(step => `<span class="chain-arrow" aria-hidden="true">→</span><span class="muted-sm">${escapeHtml(step.verb)}</span><span class="mono break">${escapeHtml(step.name)}</span>`).join('')}<span class="chain-arrow" aria-hidden="true">→</span><span class="mono accent-text semibold">${escapeHtml(path.role)}</span><span class="muted-sm">em ${escapeHtml(path.resourceName)}</span></span></button>`).join('') || `<div class="empty">${g.paths.length ? 'Nenhum caminho de origem externa.' : 'Nenhum caminho de escalada por personificação encontrado.'}</div>`);
+  setHTML('#graph-foot', pagerHTML('graph', rows.length));
+}
+async function openReach(credentialId, identity, name) {
+  const modal = $('#reach-modal'); $('#reach-title').textContent = name || identity;
+  setHTML('#reach-content', '<div class="muted">Calculando o alcance da identidade…</div>'); if (!modal.open) modal.showModal();
+  try {
+    const r = await api(`/graph/identity?credential_id=${credentialId}&identity=${encodeURIComponent(identity)}`);
+    setHTML('#reach-content', `<div class="band top stats">${stat('Recursos com acesso direto', fmt(r.directResources), `${fmt(r.privilegedDirect)} concessão(ões) privilegiada(s)`)}${stat('Recursos via personificação', `+${fmt(r.indirectResources)}`, `${fmt(r.privilegedIndirect)} privilégio(s) indireto(s)`, r.privilegedIndirect > 0)}${stat('Contas que pode personificar', fmt(r.canImpersonate.length), 'direta ou indiretamente')}${stat('Quem pode personificá-la', fmt(r.impersonatedBy.length), 'identidades com acesso a ela')}</div>
+      <div class="stack-6"><div class="overline">Pode personificar</div>${r.canImpersonate.map(item => `<div class="chain">${item.chain.map(step => `<span class="chain-arrow" aria-hidden="true">→</span><span class="muted-sm">${escapeHtml(step.verb)}</span><span class="mono break">${escapeHtml(step.name)}</span>`).join('')}</div>`).join('') || '<div class="muted">Nenhuma conta.</div>'}</div>
+      <div class="stack-6"><div class="overline">Acessos obtidos indiretamente</div><div class="table-wrap"><table class="table"><thead><tr><th>Recurso</th><th>Papel</th><th>Via</th></tr></thead><tbody>${r.indirect.map(item => `<tr><td class="break">${escapeHtml(item.resource)}</td><td class="mono break">${escapeHtml(item.role)} ${item.privileged ? '<span class="tag tag-accent">Privilegiado</span>' : ''}</td><td class="muted-sm break">${item.via.map(escapeHtml).join(' → ')}</td></tr>`).join('') || emptyRow(3, 'Nenhum acesso indireto.')}</tbody></table></div></div>
+      <div class="stack-6"><div class="overline">Quem pode personificar esta identidade</div>${r.impersonatedBy.map(edge => `<div class="key-row"><span class="break">${escapeHtml(edge.name)}</span><span class="muted-sm">pode ${escapeHtml(edge.verb)}</span><span class="mono muted-sm">${escapeHtml(edge.role)}</span></div>`).join('') || '<div class="muted">Ninguém.</div>'}</div>`);
+  } catch (error) { setHTML('#reach-content', `<div class="alert">${escapeHtml(error.message)}</div>`); }
+}
 
 /* ══ Inteligência e riscos ═══════════════════════════════════════════ */
 async function loadRisks() {
@@ -837,6 +1007,8 @@ function renderAdmin() {
   renderNextRun();
   $$('[data-notif]').forEach(box => { box.checked = Boolean(s.notifications[box.dataset.notif]); });
   $('#settings-webhook').value = s.webhook || '';
+  $('#settings-domains').value = (s.corporateDomains || []).join(', ');
+  $('#settings-domains-hint').textContent = s.corporateDomains?.length ? 'Domínios definidos manualmente.' : 'Em branco: a plataforma infere os domínios pelos e-mails das identidades humanas.';
   renderUsers();
 }
 function renderNextRun() {
@@ -850,7 +1022,7 @@ function renderUsers() {
 }
 async function saveSettings() {
   const rules = Object.fromEntries($$('[data-param]').map(input => [input.dataset.param, Number(input.value)]));
-  const payload = { rules, schedule: $('input[name="schedule"]:checked').value, notifications: Object.fromEntries($$('[data-notif]').map(box => [box.dataset.notif, box.checked])), webhook: $('#settings-webhook').value.trim() };
+  const payload = { rules, schedule: $('input[name="schedule"]:checked').value, notifications: Object.fromEntries($$('[data-notif]').map(box => [box.dataset.notif, box.checked])), webhook: $('#settings-webhook').value.trim(), corporateDomains: $('#settings-domains').value.split(/[\s,;]+/).map(item => item.trim()).filter(Boolean) };
   const button = $('#settings-save'); button.disabled = true;
   try { state.admin.settings = await api('/settings', { method: 'PUT', body: JSON.stringify(payload) }); renderAdmin(); toast('Configurações salvas. Aplicadas na próxima análise.'); }
   catch (error) { toast(error.message, 5000); } finally { button.disabled = false; }
@@ -858,7 +1030,7 @@ async function saveSettings() {
 
 /* ══ events ══════════════════════════════════════════════════════════ */
 function applyRoleVisibility() { document.body.classList.toggle('readonly', isReadonly()); }
-const PAGERS = { ids: () => renderIdentities(), acc: () => renderAccesses(), risk: () => renderRisks(), priv: () => renderPrivileged(), audit: () => renderAudit() };
+const PAGERS = { ids: () => renderIdentities(), acc: () => renderAccesses(), risk: () => renderRisks(), priv: () => renderPrivileged(), audit: () => renderAudit(), nhi: () => renderNhi(), lp: () => renderLeastPrivilege(), graph: () => renderGraphPaths() };
 document.addEventListener('click', event => {
   const target = event.target;
   const pager = target.closest('[data-pager]');
@@ -949,6 +1121,40 @@ $('#ueba-aside').addEventListener('click', async event => {
   if (expected) { const id = Number(expected.dataset.uebaExpected); const item = state.ueba.data.anomalies.find(a => a.id === id);
     justifyDialog({ title: 'Marcar como comportamento esperado?', text: `${item.title} · ${item.who}`, ok: 'Confirmar', onConfirm: async justification => { await api(`/findings/${id}`, { method: 'PATCH', body: JSON.stringify({ status: 'accepted', justification }) }); state.ueba.selected = null; toast('Comportamento marcado como esperado.'); loadUeba(); loadStatus(); } }); }
 });
+
+// Identidades não humanas
+$$('input[name="nhi-filter"]').forEach(radio => radio.addEventListener('change', () => { if (radio.checked) { state.nhi.filter = radio.value; renderNhi(); } }));
+let nhiSearchTimer;
+$('#nhi-search').addEventListener('input', event => { clearTimeout(nhiSearchTimer); nhiSearchTimer = setTimeout(() => { state.nhi.q = event.target.value; renderNhi(); }, 180); });
+$('#nhi-table').addEventListener('click', event => { const row = event.target.closest('[data-nhi]'); if (!row) return; const item = state.nhi.list.find(entry => entry.id === row.dataset.nhi && entry.credentialId === Number(row.dataset.credential)); if (item) selectNhi(item); });
+$('#nhi-aside').addEventListener('click', event => { if (event.target.closest('[data-close-nhi]')) { state.nhi.selected = null; $('#nhi-aside').hidden = true; renderNhi(); } });
+$('#nhi-export').addEventListener('click', () => downloadCsv('identidades-nao-humanas.csv', ['Identidade', 'Tipo', 'Projeto', 'Ambiente', 'Responsável', 'Evidência do responsável', 'Chaves ativas', 'Chave mais antiga (dias)', 'Último uso', 'Concessões', 'Privilegiadas', 'Personificável por', 'Sinais'],
+  filteredNhi().map(i => [i.id, i.aiKind || i.kind, i.project || '', i.environment, i.owner || '', i.ownerSource, i.activeKeys, i.oldestKeyDays ?? '', i.lastUsedAt || '', i.grantCount, i.privilegedCount, i.impersonators, i.flags.join(' | ')])));
+
+// Menor privilégio
+$$('input[name="lp-status"]').forEach(radio => radio.addEventListener('change', () => { if (radio.checked) { state.lp.status = radio.value; state.lp.selected = null; loadLeastPrivilege(); } }));
+$$('input[name="lp-action"]').forEach(radio => radio.addEventListener('change', () => { if (radio.checked) { state.lp.action = radio.value; renderLeastPrivilege(); } }));
+let lpSearchTimer;
+$('#lp-search').addEventListener('input', event => { clearTimeout(lpSearchTimer); lpSearchTimer = setTimeout(() => { state.lp.q = event.target.value; renderLeastPrivilege(); }, 180); });
+$('#lp-table').addEventListener('click', event => { const row = event.target.closest('[data-rec]'); if (row) { state.lp.selected = Number(row.dataset.rec); renderLeastPrivilege(); } });
+$('#lp-aside').addEventListener('click', async event => {
+  if (event.target.closest('[data-close-lp]')) { state.lp.selected = null; renderLeastPrivilege(); return; }
+  const copy = event.target.closest('[data-copy-command]');
+  if (copy) { const rec = state.lp.list.find(item => item.id === Number(copy.dataset.copyCommand)); try { await navigator.clipboard.writeText(rec.command); toast('Comando copiado.'); } catch { toast('Selecione e copie o comando manualmente.'); } return; }
+  const change = event.target.closest('[data-rec-status]'); if (!change) return;
+  const rec = state.lp.list.find(item => item.id === Number(change.dataset.id));
+  if (change.dataset.recStatus === 'dismissed') {
+    justifyDialog({ title: 'Descartar recomendação?', text: `${rec.actionLabel}: ${rec.identityName} · ${rec.role} em ${rec.resourceName}`, ok: 'Descartar',
+      onConfirm: async justification => { await api(`/recommendations/${rec.id}`, { method: 'PATCH', body: JSON.stringify({ status: 'dismissed', justification }) }); toast('Recomendação descartada e auditada.'); state.lp.selected = null; loadLeastPrivilege(); } });
+  } else { await api(`/recommendations/${rec.id}`, { method: 'PATCH', body: JSON.stringify({ status: 'open' }) }); toast('Recomendação reaberta.'); state.lp.selected = null; loadLeastPrivilege(); }
+});
+$('#lp-export-script').addEventListener('click', exportRecommendationsScript);
+$('#lp-export-csv').addEventListener('click', () => downloadCsv('recomendacoes-menor-privilegio.csv', ['Severidade', 'Identidade', 'Tipo', 'Provedor', 'Recurso', 'Papel atual', 'Ação', 'Papéis sugeridos', 'Motivo', 'Fonte', 'Situação', 'Comando'],
+  filteredRecommendations().map(r => [r.severity, r.identityId, r.identityType, r.provider, r.resourceName, r.role, r.actionLabel, r.suggestedRoles.join(' '), r.reason, r.source, r.status, r.command])));
+
+// Caminhos de acesso
+$('#graph-external').addEventListener('change', event => { state.graph.external = event.target.checked; renderGraphPaths(); });
+document.addEventListener('click', event => { const reach = event.target.closest('[data-reach]'); if (reach) openReach(Number(reach.dataset.credential), reach.dataset.reach, reach.dataset.name); });
 
 // Credenciais
 ['#new-credential-top', '#new-credential-page', '#new-credential-empty'].forEach(selector => $(selector).addEventListener('click', () => openCredentialDialog()));

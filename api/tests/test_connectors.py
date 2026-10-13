@@ -220,6 +220,9 @@ class ConnectorNormalizationTest(unittest.TestCase):
         self.assertEqual(usage["lastAuth"]["sa@p.iam.gserviceaccount.com"], "2026-10-01T00:00:00Z")
         session.get.side_effect = lambda url, **_kwargs: FakeResponse({}, ok=False, status_code=403)
         self.assertEqual(connectors.gcp_usage(object(), ["p"])["status"], "permission_denied")
+        disabled = {"error": {"status": "PERMISSION_DENIED", "message": "Policy Analyzer API has not been used in project 922714182532 before or it is disabled."}}
+        session.get.side_effect = lambda url, **_kwargs: FakeResponse(disabled, ok=False, status_code=403)
+        self.assertEqual(connectors.gcp_usage(object(), ["p"])["detail"], "habilite a Policy Analyzer API no projeto 922714182532")
 
 
     def test_anomaly_explanation_for_denied_automation_loop(self):
